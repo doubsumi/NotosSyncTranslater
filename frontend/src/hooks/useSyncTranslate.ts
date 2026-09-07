@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createApi } from "../lib/api";
 import {
+  type Alignment,
   type ControllerState,
   type Side,
   type ToastMessage,
@@ -21,6 +22,8 @@ export interface SyncActions {
   retranslate: () => void;
   toast: (kind: ToastMessage["kind"], message: string) => void;
   dismissToast: (id: number) => void;
+  /** Exact sentence alignment for the pane the user is interacting with. */
+  alignment: (side: Side) => Alignment | null;
 }
 
 const EMPTY_STATE: ControllerState = {
@@ -104,6 +107,7 @@ export function useSyncTranslate(): {
     },
     toast: (kind, message) => pushToast(kind, message),
     dismissToast,
+    alignment: (side) => controller?.alignFor(side) ?? null,
   };
 
   return { state, actions, toasts };

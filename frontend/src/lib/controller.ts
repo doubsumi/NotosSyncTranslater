@@ -1,25 +1,32 @@
 // ---------------------------------------------------------------------------
 // SyncController — the brain of the two-way live translator.
 //
-// Guarantees implemented here (and unit-tested):
-//   1. Two-way editing: whatever pane the user types in becomes the source,
-//      the other pane follows.
-//   2. Debounce (trailing pause + max-wait) with abort of stale work: at most
-//      one request chain runs per burst; older results never clobber newer.
-//   3. Sentence-level translation memory (TM): requests are scoped to the
-//      *sentence* the user changed — unchanged sentences and paragraphs are
-//      spliced from memory with zero network traffic (edit-here / update-here).
-//   4. Whole documents are processed in bounded waves (no input length cap),
-//      progressively filling the target pane with progress feedback.
-//   5. Results never overwrite text the user is actively editing; partial
-//      failures surface as retryable toasts, never as inline errors.
+// Incremental design (see README "research" for why this is the commercial
+// pattern):
+//   document → blocks (1:1 line layout) → bounded sentence units (≤400 chars)
+// The units are the request/TM granularity. On every edit the controller
+// re-segments the source and asks the server for *only the units whose text
+// is not in translation memory* — a local edit re-sends a handful of small
+// sentences, never a whole paragraph, and no single request can grow without
+// bound (root cause of long waits / timeouts on dense unpunctuated text).
+//
+// Additional guarantees (unit-tested):
+//   2. Debounce (800 ms trailing, 2.6 s max-wait) + stale-work cancellation.
+//   3. Bounded waves with per-wave timeout self-healing: if a whole wave
+//      fails/times out, it is retried one item at a time so one bad sentence
+//      cannot stall the rest or blow the request timeout.
+//   4. Exact sentence mapping (`alignFor`) so the UI can highlight the
+//      corresponding original/translation sentence in the other pane.
+//   5. Results never overwrite text the user is editing; failures surface as
+//      retryable toasts, never as inline errors.
 // ---------------------------------------------------------------------------
 
 import {
-  joinSentenceParts,
+  composeUnits,
+  mapBlocks,
   rebuildWithResolver,
   splitBlocks,
-  splitSentences,
+  splitRequestUnits,
 } from "./blocks";
 import { defaultTargetFor, detectLanguage, type LangCode } from "./detection";
 import { debounce, type Debounced } from "./debounce";
@@ -53,7 +60,6 @@ export interface ControllerState {
   right: PaneState;
   active: Side | null;
   phase: "idle" | "translating";
-  /** Human status, e.g. "已由 bing 翻译 · 412 ms" or "正在翻译 3/12 段". */
   statusText: string | null;
   provider: string | null;
   lastElapsedMs: number | null;
@@ -77,6 +83,20 @@ export interface ControllerOptions {
   /** Guaranteed maximum wait while the user types continuously. */
   maxWaitMs?: number;
   waveSize?: number;
+}
+
+/** One aligned sentence/unit: character range in both panes. */
+export interface AlignRow {
+  srcS: number;
+  srcE: number;
+  dstS: number;
+  dstE: number;
+}
+
+export interface Alignment {
+  /** The pane holding the *source* text of the pair. */
+  srcSide: Side;
+  rows: AlignRow[];
 }
 
 const EMPTY_PANE = (): PaneState => ({
@@ -130,6 +150,8 @@ export class SyncController {
     progress: null,
   };
 
+  /** Side whose text is the source of the currently aligned pair. */
+  private mappingSide: Side | null = null;
   private generation = 0;
   private wave: WaveJob | null = null;
   private toastSeq = 0;
@@ -141,8 +163,7 @@ export class SyncController {
     this.onToast = opts.onToast;
     this.waveSize = Math.min(Math.max(opts.waveSize ?? 12, 1), 64);
     // 800 ms after the last keystroke, at most every 2.6 s while typing
-    // continuously — long enough to batch a whole sentence, short enough to
-    // feel live.
+    // continuously — long enough to batch a whole sentence.
     this.debounced = debounce(opts.debounceMs ?? 800, opts.maxWaitMs ?? 2600);
   }
 
@@ -170,12 +191,14 @@ export class SyncController {
           lang === "auto" ? this.refreshDetected(side, pane.text) : pane.detected,
       },
     }));
+    this.mappingSide = null;
     const active = this.state.active;
     if (active) this.runNow();
   }
 
   swap(): void {
     const s = this.state;
+    this.mappingSide = null;
     this.setState((st) => ({
       ...st,
       left: { ...s.right, busy: false },
@@ -191,6 +214,7 @@ export class SyncController {
     this.cancelInflight();
     this.debounced.cancel();
     this.generation++;
+    this.mappingSide = null;
     this.setState((s) => ({
       ...s,
       left: { ...s.left, text: "", detected: "auto", busy: false },
@@ -215,17 +239,86 @@ export class SyncController {
   retranslateAll(): void {
     const active = this.state.active;
     if (!active) return;
+    this.mappingSide = null;
     void this.run(true);
   }
 
   /** Load a previously persisted session without triggering translation. */
   restore(left: PaneState, right: PaneState): void {
     this.setState((s) => ({ ...s, left, right, active: null }));
+    this.mappingSide = null;
   }
 
   dispose(): void {
     this.debounced.cancel();
     this.cancelInflight();
+  }
+
+  /**
+   * Exact sentence alignment of the currently displayed pair, or null when
+   * the target pane is not byte-identical to what memory can compose (e.g.
+   * mid-flight partial output, or the target was hand-edited). The UI falls
+   * back to proportional paragraph mapping in that case.
+   */
+  alignFor(selectedSide: Side): Alignment | null {
+    const srcSide = this.mappingSide;
+    if (!srcSide) return null;
+    const src = this.state[srcSide];
+    const dstSide = opposite(srcSide);
+    const dst = this.state[dstSide];
+    if (!src.text.trim() || !dst.text) return null;
+    // Only meaningful when the user interacts with one of the aligned panes.
+    if (selectedSide !== srcSide && selectedSide !== dstSide) return null;
+
+    const pair = computePair(src, dst, src.text);
+    if (pair.to === "auto") return null;
+
+    const blocks = splitBlocks(src.text);
+    const rows: AlignRow[] = [];
+    const assembled: string[] = [];
+    const spans = mapBlocks(src.text);
+    let cursor = 0;
+    let delta = 0; // target length - source length accumulated above blocks
+    for (let bi = 0; bi < spans.length; bi++) {
+      const [bStart, bEnd] = spans[bi];
+      const content = blocks[bi];
+      assembled.push(src.text.slice(cursor, bStart));
+      const units = splitRequestUnits(content);
+      const translations: string[] = [];
+      let resolved = true;
+      for (const unit of units) {
+        const t = this.tm.get(pair.from, pair.to, unit.text);
+        if (t === undefined) {
+          resolved = false;
+          break;
+        }
+        translations.push(t);
+      }
+      if (!resolved) return null;
+      const composed = composeUnits(units, translations, true);
+      assembled.push(composed.text.replace(/\r?\n/g, " "));
+
+      // Local src offsets (unit text + following ws keep rows contiguous).
+      let srcLocal = 0;
+      for (let ui = 0; ui < units.length; ui++) {
+        const srcS = bStart + srcLocal;
+        const srcE = srcS + units[ui].text.length + units[ui].ws.length;
+        const dstS = bStart + delta + (composed.units[ui]?.start ?? 0);
+        const dstE =
+          bStart +
+          delta +
+          (ui + 1 < composed.units.length
+            ? composed.units[ui + 1].start
+            : composed.text.length);
+        rows.push({ srcS, srcE, dstS, dstE });
+        srcLocal = srcE - bStart;
+      }
+      delta += composed.text.length - content.length;
+      cursor = bEnd;
+    }
+    assembled.push(src.text.slice(cursor));
+    if (assembled.join("") !== dst.text) return null; // pane drifted
+    return { srcSide, rows };
   }
 
   // ------------------------------------------------------------------
@@ -282,6 +375,7 @@ export class SyncController {
 
     if (srcText.trim().length === 0) {
       if (target.text.length > 0) this.applyTo(dst, "");
+      this.mappingSide = null;
       this.setState((s) => ({
         ...s,
         phase: "idle",
@@ -301,25 +395,25 @@ export class SyncController {
 
     const blocks = splitBlocks(srcText);
 
-    // Collect the sentence parts that still lack a translation (the ONLY
-    // things we ever send to the server). Identical sentences anywhere in the
-    // document collapse into one request.
+    // Collect the bounded units that still lack a translation — the ONLY
+    // things ever sent to the server. Identical units collapse into one.
     const missingTexts: string[] = [];
     const seen = new Set<string>();
     for (const content of blocks) {
-      for (const part of splitSentences(content)) {
-        const cached = !force && this.tm.get(pair.from, pair.to, part.text);
-        if (cached === undefined && !seen.has(part.text)) {
-          seen.add(part.text);
-          missingTexts.push(part.text);
+      for (const unit of splitRequestUnits(content)) {
+        const cached = !force && this.tm.get(pair.from, pair.to, unit.text);
+        if (cached === undefined && !seen.has(unit.text)) {
+          seen.add(unit.text);
+          missingTexts.push(unit.text);
         }
       }
     }
 
-    // Fast path: translation memory already covers every sentence.
+    // Fast path: memory already covers every unit.
     if (missingTexts.length === 0) {
       const out = this.assembleDoc(srcText, blocks, pair, null);
       this.applyTo(dst, out.text);
+      if (out.unresolved === 0) this.mappingSide = active;
       this.setState((s) => ({
         ...s,
         phase: "idle",
@@ -343,10 +437,9 @@ export class SyncController {
   }
 
   /**
-   * Rebuild the target document: for every source block, splice the sentence
-   * translations that are known; blocks with unknown sentences fall back to
-   * the currently displayed target block (or to the source text when there is
-   * no previous target yet).
+   * Rebuild the target document: for every source block splice the known unit
+   * translations; blocks with unknown units fall back to the previously
+   * displayed target block (or the source text when no target exists yet).
    */
   private assembleDoc(
     srcText: string,
@@ -356,27 +449,26 @@ export class SyncController {
   ): { text: string; unresolved: number } {
     const fbBlocks = fallbackTarget !== null ? splitBlocks(fallbackTarget) : null;
     let unresolved = 0;
-    const resolved = rebuildWithResolver(srcText, (blockIdx, content) => {
-      const parts = splitSentences(content);
+    const text = rebuildWithResolver(srcText, (blockIdx, content) => {
+      const units = splitRequestUnits(content);
       const translations: string[] = [];
-      for (const part of parts) {
-        const cached = this.tm.get(pair.from, pair.to, part.text);
+      for (const unit of units) {
+        const cached = this.tm.get(pair.from, pair.to, unit.text);
         if (cached === undefined) {
           translations.length = 0;
           break;
         }
         translations.push(cached);
       }
-      if (translations.length === parts.length) {
-        // Smart spacing: avoid stray spaces between CJK segments.
-        return joinSentenceParts(parts, translations, true).replace(/\r?\n/g, " ");
+      if (translations.length === units.length) {
+        return composeUnits(units, translations, true).text.replace(/\r?\n/g, " ");
       }
       unresolved++;
       const fallback =
         fbBlocks !== null && blockIdx < fbBlocks.length ? fbBlocks[blockIdx] : null;
       return fallback ?? blocks[blockIdx];
     });
-    return { text: resolved, unresolved };
+    return { text, unresolved };
   }
 
   private async runSegmentWaves(args: {
@@ -413,27 +505,58 @@ export class SyncController {
 
     const idFor = (index: number): string => `${gen}:${active}:${index}`;
 
+    /** Translate a list of unit texts; on whole-wave failure retries each
+     *  unit individually so a single bad sentence cannot stall everything. */
+    const fetchItems = async (
+      items: Array<{ id: string; text: string }>
+    ): Promise<BatchResult[]> => {
+      try {
+        return await this.api.translateBatch(
+          items.map((it) => ({
+            id: it.id,
+            text: it.text,
+            from: pair.from,
+            to: pair.to,
+            noCache: force,
+          })),
+          controller.signal
+        );
+      } catch (err) {
+        if (this.generation !== gen) throw err;
+        errorMessage = err instanceof Error ? err.message : String(err);
+        // Degrade gracefully: one request at a time.
+        const singles: BatchResult[] = [];
+        for (const item of items) {
+          if (this.generation !== gen) return singles;
+          try {
+            const res = await this.api.translateBatch(
+              [{ id: item.id, text: item.text, from: pair.from, to: pair.to, noCache: force }],
+              controller.signal
+            );
+            singles.push(...res);
+          } catch (singleErr) {
+            singles.push({
+              id: item.id,
+              ok: false,
+              error: {
+                code: "ITEM_FAILED",
+                message:
+                  singleErr instanceof Error ? singleErr.message : String(singleErr),
+              },
+            });
+          }
+        }
+        return singles;
+      }
+    };
+
     try {
       for (let offset = 0; offset < missingTexts.length; offset += this.waveSize) {
         if (this.generation !== gen) return; // superseded mid-flight
         const slice = missingTexts.slice(offset, offset + this.waveSize);
-        const items = slice.map((text, i) => ({
-          id: idFor(offset + i),
-          text,
-          from: pair.from,
-          to: pair.to,
-          noCache: force,
-        }));
+        const items = slice.map((text, i) => ({ id: idFor(offset + i), text }));
 
-        let results: BatchResult[];
-        try {
-          results = await this.api.translateBatch(items, controller.signal);
-        } catch (err) {
-          errorMessage = err instanceof Error ? err.message : String(err);
-          failedTexts = failedTexts.concat(slice);
-          if (this.generation !== gen) return;
-          break;
-        }
+        const results = await fetchItems(items);
         if (this.generation !== gen) return; // aborted while awaiting
 
         const byId = new Map(results.map((r) => [r.id, r]));
@@ -451,8 +574,7 @@ export class SyncController {
 
         this.setState((s) => ({
           ...s,
-          statusText:
-            total > 1 ? `正在翻译 ${okCount}/${total} 句` : "正在翻译…",
+          statusText: total > 1 ? `正在翻译 ${okCount}/${total} 句` : "正在翻译…",
           progress: { done: okCount, total },
         }));
 
@@ -461,6 +583,7 @@ export class SyncController {
         if (this.state.active === active && currentTarget.text === expectedTarget) {
           const assembled = this.assembleDoc(srcText, blocks, pair, currentTarget.text);
           this.applyTo(dst, assembled.text);
+          if (assembled.unresolved === 0) this.mappingSide = active;
           expectedTarget = assembled.text;
         }
       }

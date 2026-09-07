@@ -2,29 +2,53 @@ import { useCallback, useEffect, useRef } from "react";
 import { ToastHost } from "./components/ToastHost";
 import { TranslatePane } from "./components/TranslatePane";
 import { Icon } from "./components/Icon";
+import { type AlignRow, type Side } from "./lib/controller";
 import { blockRangeForSelection, mapBlocks, textProgress } from "./lib/blocks";
-import { type Side } from "./lib/controller";
 import { useSyncTranslate } from "./hooks/useSyncTranslate";
 
 type Role = "source" | "target";
 
+/**
+ * Cross-pane linking.
+ *
+ * Two independent mechanisms:
+ *  1. exact sentence/unit mapping when the target pane is byte-identical to
+ *     what the translation memory composes (controller.alignFor), and
+ *  2. a proportional paragraph fallback whenever it is not.
+ * A 120 ms lock prevents programmatic selection/scroll from echoing back.
+ */
+
 export default function App(): JSX.Element {
   const { state, actions, toasts } = useSyncTranslate();
 
-  // ------------------------------------------------------------------
-  // Scroll + selection linking between the two textareas.
-  // ------------------------------------------------------------------
   const leftInputRef = useRef<HTMLTextAreaElement | null>(null);
   const rightInputRef = useRef<HTMLTextAreaElement | null>(null);
-  // Timestamp lock: programmatic scroll/selection must not echo back.
   const uiLockUntil = useRef(0);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashVersion = useRef(0);
+  const lastCaretKey = useRef("");
+
   const isLocked = useCallback(() => performance.now() < uiLockUntil.current, []);
   const lock = useCallback((ms: number) => {
     uiLockUntil.current = performance.now() + ms;
   }, []);
 
-  // 1) Scrolling one pane mirrors the other (ratio-based; both documents
-  //    share the same line layout because translations never add newlines).
+  const ta = useCallback(
+    (side: Side): HTMLTextAreaElement | null =>
+      side === "left" ? leftInputRef.current : rightInputRef.current,
+    []
+  );
+
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    },
+    []
+  );
+
+  // ------------------------------------------------------------------
+  // Scroll linking
+  // ------------------------------------------------------------------
   useEffect(() => {
     const left = leftInputRef.current;
     const right = rightInputRef.current;
@@ -49,68 +73,167 @@ export default function App(): JSX.Element {
       left.removeEventListener("scroll", onL);
       right.removeEventListener("scroll", onR);
     };
-  }, [isLocked, lock]);
+  }, [isLocked, lock, ta]);
 
-  // 2) Selecting text in one pane highlights the corresponding region in the
-  //    other. Both panes share block-aligned layout; inside a block the
-  //    mapping is proportional (sentence lengths differ across languages).
-  const syncSelectionFrom = useCallback(
-    (side: Side) => {
-      if (isLocked()) return;
-      const src = side === "left" ? leftInputRef.current : rightInputRef.current;
-      const dst = side === "left" ? rightInputRef.current : leftInputRef.current;
-      if (!src || !dst || src.value.length === 0) return;
-      const selStart = src.selectionStart ?? 0;
-      const selEnd = src.selectionEnd ?? 0;
-      if (selEnd <= selStart) return;
-
-      const srcBlocks = mapBlocks(src.value);
-      const dstBlocks = mapBlocks(dst.value);
-      if (srcBlocks.length === 0 || dstBlocks.length === 0) return;
-      if (srcBlocks.length !== dstBlocks.length) return; // layout diverged
-
-      const range = blockRangeForSelection(src.value, selStart, selEnd);
-      if (!range) return;
-      const [lo, hi] = range;
-
-      const [srcBlockStart, srcBlockEnd] = srcBlocks[lo];
-      const [dstBlockStart, dstBlockEnd] = dstBlocks[lo];
-      const [, dstBlockLastEnd] = dstBlocks[hi];
-
-      // Proportional mapping inside the first selected block …
-      const inBlockStart = Math.max(selStart, srcBlockStart);
-      const srcSpan = Math.max(1, srcBlockEnd - srcBlockStart);
-      const dstSpanStart = Math.max(1, dstBlockEnd - dstBlockStart);
-      let toStart = Math.round(
-        dstBlockStart + ((inBlockStart - srcBlockStart) / srcSpan) * dstSpanStart
-      );
-      let toEnd =
-        hi > lo
-          ? dstBlockLastEnd
-          : Math.round(
-              dstBlockStart +
-                ((selEnd - srcBlockStart) / srcSpan) * dstSpanStart
-            );
-      toStart = Math.min(Math.max(toStart, dstBlockStart), dstBlockEnd);
-      toEnd = Math.min(Math.max(toEnd, toStart), dstBlockEnd);
-
-      if (toEnd <= toStart) return;
-      lock(120);
-      dst.setSelectionRange(toStart, toEnd);
-
-      // Bring the highlighted region into view on the partner pane.
-      const fraction = textProgress(dst.value, toStart);
-      const maxScroll = dst.scrollHeight - dst.clientHeight;
+  /** Select a range inside a textarea and scroll it into view. */
+  const selectIn = useCallback(
+    (el: HTMLTextAreaElement, from: number, to: number) => {
+      if (to <= from) return;
+      const len = el.value.length;
+      const a = Math.max(0, Math.min(from, len));
+      const b = Math.max(a, Math.min(to, len));
+      lock(140);
+      el.setSelectionRange(a, b);
+      const maxScroll = el.scrollHeight - el.clientHeight;
       if (maxScroll > 0) {
-        dst.scrollTop = Math.max(0, Math.min(maxScroll, fraction * maxScroll));
+        el.scrollTop = Math.max(
+          0,
+          Math.min(maxScroll, textProgress(el.value, a) * maxScroll)
+        );
       }
     },
-    [isLocked, lock]
+    [lock]
   );
 
-  const handleUserSelection = useCallback(
-    (side: Side) => () => syncSelectionFrom(side),
-    [syncSelectionFrom]
+  /** Find the unit rows intersected by [from,to) in the given coordinate. */
+  const rowIndexRange = useCallback(
+    (rows: readonly AlignRow[], useDst: boolean, from: number, to: number) => {
+      let lo = -1;
+      let hi = -1;
+      for (let i = 0; i < rows.length; i++) {
+        const s = useDst ? rows[i].dstS : rows[i].srcS;
+        const e = useDst ? rows[i].dstE : rows[i].srcE;
+        if (e <= from || s >= to) continue;
+        if (lo === -1) lo = i;
+        hi = i;
+      }
+      return lo === -1 ? null : ([lo, hi] as const);
+    },
+    []
+  );
+
+  /** Proportional paragraph-level fallback (previous behaviour). */
+  const fallbackLink = useCallback(
+    (side: Side, from: number, to: number) => {
+      const src = ta(side);
+      const dst = ta(side === "left" ? "right" : "left");
+      if (!src || !dst) return;
+      const srcBlocks = mapBlocks(src.value);
+      const dstBlocks = mapBlocks(dst.value);
+      if (
+        srcBlocks.length === 0 ||
+        dstBlocks.length === 0 ||
+        srcBlocks.length !== dstBlocks.length
+      ) {
+        return;
+      }
+      const range = blockRangeForSelection(src.value, from, to);
+      if (!range) return;
+      const [lo, hi] = range;
+      const [, srcEnd] = srcBlocks[lo];
+      const [dstStart, dstEnd] = dstBlocks[lo];
+      const [, dstLastEnd] = dstBlocks[hi];
+      const dstFrom =
+        dstStart +
+        Math.round(
+          ((Math.max(from, srcBlocks[lo][0]) - srcBlocks[lo][0]) /
+            Math.max(1, srcEnd - srcBlocks[lo][0])) *
+            Math.max(1, dstEnd - dstStart)
+        );
+      const dstTo = hi > lo ? dstLastEnd : dstFrom + Math.max(1, to - from);
+      selectIn(dst, dstFrom, Math.min(dstTo, dstLastEnd));
+    },
+    [selectIn, ta]
+  );
+
+  /** Mirror a source selection/caret to the aligned target range. */
+  const linkFrom = useCallback(
+    (side: Side, from: number, to: number) => {
+      const src = ta(side);
+      const other = ta(side === "left" ? "right" : "left");
+      if (!src || !other) return;
+      if (isLocked()) return;
+      const alignment = actions.alignment(side);
+      if (!alignment) {
+        fallbackLink(side, from, to);
+        return;
+      }
+      const selectedIsSource = side === alignment.srcSide;
+      const useDst = selectedIsSource;
+      const range = rowIndexRange(alignment.rows, useDst, from, to);
+      if (!range) {
+        fallbackLink(side, from, to);
+        return;
+      }
+      const [lo, hi] = range;
+      const rows = alignment.rows;
+      const targetFrom = useDst ? rows[lo].dstS : rows[lo].srcS;
+      const targetTo = useDst ? rows[hi].dstE : rows[hi].srcE;
+      selectIn(other, targetFrom, targetTo);
+    },
+    [actions, fallbackLink, isLocked, rowIndexRange, selectIn, ta]
+  );
+
+  /**
+   * Pointer interaction: with a real selection we mirror it; with a caret in
+   * the middle of text we highlight that sentence on the other side and flash
+   * it briefly on the active side too (without disturbing the caret).
+   */
+  const handlePointer = useCallback(
+    (side: Side) => {
+      const el = ta(side);
+      if (!el) return;
+      const from = el.selectionStart ?? 0;
+      const to = el.selectionEnd ?? 0;
+      if (from !== to) {
+        flashVersion.current++;
+        linkFrom(side, from, to);
+        return;
+      }
+      const text = el.value;
+      if (!text || from <= 0 || from >= text.length) return;
+
+      const alignment = actions.alignment(side);
+      if (!alignment) return;
+      const selectedIsSource = side === alignment.srcSide;
+      const rows = alignment.rows;
+      const useDst = !selectedIsSource;
+      const caretRow = rows.find((r) => {
+        const s = useDst ? r.dstS : r.srcS;
+        const e = useDst ? r.dstE : r.srcE;
+        return from >= s && from < e;
+      });
+      if (!caretRow) return;
+
+      const key = `${side}:${caretRow.srcS}:${caretRow.srcE}`;
+      if (key === lastCaretKey.current) return; // no churn on repeat clicks
+      lastCaretKey.current = key;
+
+      const other = ta(side === "left" ? "right" : "left");
+      if (other) {
+        const otherFrom = selectedIsSource ? caretRow.dstS : caretRow.srcS;
+        const otherTo = selectedIsSource ? caretRow.dstE : caretRow.srcE;
+        selectIn(other, otherFrom, otherTo);
+      }
+
+      // Flash the active side's sentence while keeping the caret position.
+      const ownFrom = selectedIsSource ? caretRow.srcS : caretRow.dstS;
+      const ownTo = selectedIsSource ? caretRow.srcE : caretRow.dstE;
+      const version = ++flashVersion.current;
+      const caret = from;
+      lock(120);
+      el.setSelectionRange(ownFrom, ownTo);
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+      flashTimer.current = setTimeout(() => {
+        if (flashVersion.current !== version) return; // stale flash
+        if (el.value === text) {
+          lock(80);
+          el.setSelectionRange(caret, caret);
+        }
+        lastCaretKey.current = "";
+      }, 260);
+    },
+    [actions, linkFrom, lock, selectIn, ta]
   );
 
   const roleFor = (side: Side): Role =>
@@ -194,7 +317,7 @@ export default function App(): JSX.Element {
             role={roleFor("left")}
             progress={state.progress}
             inputRef={leftInputRef}
-            onUserSelection={handleUserSelection("left")}
+            onUserSelection={() => handlePointer("left")}
             onEdit={(text) => actions.edit("left", text)}
             onChangeLang={(lang) => actions.changeLang("left", lang)}
             onToast={(kind, message) => actions.toast(kind, message)}
@@ -211,7 +334,7 @@ export default function App(): JSX.Element {
             role={roleFor("right")}
             progress={state.progress}
             inputRef={rightInputRef}
-            onUserSelection={handleUserSelection("right")}
+            onUserSelection={() => handlePointer("right")}
             onEdit={(text) => actions.edit("right", text)}
             onChangeLang={(lang) => actions.changeLang("right", lang)}
             onToast={(kind, message) => actions.toast(kind, message)}
@@ -222,7 +345,7 @@ export default function App(): JSX.Element {
         <footer className="app-footer">
           <p>
             使用免费公共翻译引擎（Bing / Alibaba / Sogou 自动切换），文本仅用于翻译请求；不设长度上限，
-            长文按句切分、只增量请求被修改的句子；两侧滚动与选区同步。项目开源于 MIT License。
+            长文按句切分、只增量请求被修改的句子；两侧滚动与选区/光标句子联动。项目开源于 MIT License。
           </p>
         </footer>
       </main>

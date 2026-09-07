@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   blockRangeForSelection,
   changedRange,
+  composeUnits,
   fnv1a,
   joinSentenceParts,
   mapBlocks,
   rebuildWithTranslations,
   splitBlocks,
+  splitRequestUnits,
   splitSentences,
 } from "./blocks";
 
@@ -122,5 +124,53 @@ describe("blockRangeForSelection", () => {
   it("returns null for collapsed or empty selections", () => {
     expect(blockRangeForSelection("abc\ndef", 1, 1)).toBeNull();
     expect(blockRangeForSelection("", 0, 0)).toBeNull();
+  });
+});
+
+describe("splitRequestUnits (bounded units)", () => {
+  it("round-trips ordinary sentences unchanged", () => {
+    const block = "One. Two. Three.";
+    const units = splitRequestUnits(block);
+    expect(units.map((u) => u.text)).toEqual(["One.", "Two.", "Three."]);
+  });
+
+  it("bounds a dense unpunctuated run and keeps join identity", () => {
+    const dense = "x".repeat(1000);
+    const units = splitRequestUnits(dense);
+    expect(units.length).toBeGreaterThan(2);
+    for (const u of units) expect(u.text.length).toBeLessThanOrEqual(400);
+    expect(units.map((u) => u.text + u.ws).join("")).toBe(dense);
+  });
+
+  it("splits long sentences at whitespace when available", () => {
+    const long = `${"word ".repeat(200)}end`;
+    const units = splitRequestUnits(long);
+    for (const u of units) expect(u.text.length).toBeLessThanOrEqual(400);
+    expect(units.map((u) => u.text + u.ws).join("")).toBe(long);
+  });
+});
+
+describe("composeUnits", () => {
+  it("exposes contiguous output offsets per unit", () => {
+    const parts = [
+      { text: "One.", ws: " " },
+      { text: "Two.", ws: "" },
+    ];
+    const { text, units } = composeUnits(parts, ["一。", "二。"], false);
+    expect(text).toBe("一。 二。");
+    expect(units[0].start).toBe(0);
+    expect(units[0].end).toBe(2); // "一。"
+    expect(units[1].start).toBe(3); // ws added after first unit
+    expect(units[1].end).toBe(5); // "二。"
+  });
+
+  it("is the same implementation as joinSentenceParts", () => {
+    const parts = [
+      { text: "今天很好。", ws: "" },
+      { text: "明天也好。", ws: "" },
+    ];
+    expect(joinSentenceParts(parts, ["Today is fine.", "Tomorrow too."], true)).toBe(
+      "Today is fine.Tomorrow too."
+    );
   });
 });

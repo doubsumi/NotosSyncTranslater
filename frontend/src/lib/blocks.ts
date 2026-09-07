@@ -177,6 +177,10 @@ function isCjkChar(ch: string): boolean {
   return (c >= 0x2e80 && c <= 0x9fff) || (c >= 0xff00 && c <= 0xffef);
 }
 
+export function isCjkish(char: string): boolean {
+  return char.length > 0 && isCjkChar(char.charAt(0));
+}
+
 /**
  * Join per-part translations, re-inserting the original inter-part
  * whitespace. With `smartSpacing` (default false) the space is dropped when
@@ -188,26 +192,99 @@ export function joinSentenceParts(
   translations: readonly string[],
   smartSpacing = false
 ): string {
-  if (parts.length === 0) return "";
-  const pieces: string[] = [];
+  return composeUnits(parts, translations, smartSpacing).text;
+}
+
+export interface ComposedUnit {
+  /** Character range (start, end) of this unit's translation in the result. */
+  start: number;
+  end: number;
+}
+
+/**
+ * Single source of truth for composing unit translations back into one text.
+ * Also returns each unit's offsets in the result, which the UI uses for
+ * exact cross-pane sentence mapping/highlighting.
+ */
+export function composeUnits(
+  parts: readonly SentencePart[],
+  translations: readonly string[],
+  smartSpacing = false
+): { text: string; units: ComposedUnit[] } {
+  const units: ComposedUnit[] = [];
+  let out = "";
   for (let i = 0; i < parts.length; i++) {
-    pieces.push(translations[i] ?? parts[i].text);
-  }
-  let out = pieces[0];
-  for (let i = 1; i < parts.length; i++) {
-    const prevPart = parts[i - 1];
-    let ws = prevPart.ws;
-    if (
-      smartSpacing &&
-      ws.length > 0 &&
-      isCjkChar(pieces[i - 1].slice(-1)) &&
-      isCjkChar(pieces[i].charAt(0))
-    ) {
-      ws = "";
+    const translated = translations[i] ?? parts[i].text;
+    const start = out.length;
+    out += translated;
+    units.push({ start, end: out.length });
+    if (i + 1 < parts.length) {
+      let ws = parts[i].ws;
+      if (
+        smartSpacing &&
+        ws.length > 0 &&
+        isCjkChar(translated.slice(-1)) &&
+        isCjkChar((translations[i + 1] ?? parts[i + 1].text).charAt(0))
+      ) {
+        ws = "";
+      }
+      out += ws;
     }
-    out += ws + pieces[i];
   }
+  return { text: out, units };
+}
+
+// ---------------------------------------------------------------------------
+// Bounded request units
+//
+// A single sentence may still be huge (dense prose pasted without any
+// sentence punctuation). Any such run is deterministically sub-chunked so that
+// no single upstream request can grow unboundedly — the root cause of
+// "whole paragraph resubmission + timeout". Chunks are content-derived, so
+// an edit inside one chunk leaves every other chunk textually identical and
+// still served from translation memory.
+// ---------------------------------------------------------------------------
+
+export const MAX_UNIT_CHARS = 400;
+
+function splitLongText(text: string, limit: number): string[] {
+  const out: string[] = [];
+  let rest = text;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf(" ", limit);
+    if (cut <= 0) {
+      cut = limit;
+      // Never split a surrogate pair.
+      if (cut < rest.length) {
+        const c = rest.charCodeAt(cut);
+        if (c >= 0xdc00 && c <= 0xdfff) cut -= 1;
+      }
+      if (cut <= 0) cut = Math.max(1, Math.min(limit, rest.length));
+    }
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest.length > 0 || out.length === 0) out.push(rest);
   return out;
+}
+
+/**
+ * The request/TM units of a block: sentence parts, with any over-long part
+ * deterministically split. `join(text+ws) === block` still holds.
+ */
+export function splitRequestUnits(block: string): SentencePart[] {
+  const units: SentencePart[] = [];
+  for (const part of splitSentences(block)) {
+    if (part.text.length <= MAX_UNIT_CHARS) {
+      units.push(part);
+      continue;
+    }
+    const pieces = splitLongText(part.text, MAX_UNIT_CHARS);
+    for (let i = 0; i < pieces.length; i++) {
+      units.push({ text: pieces[i], ws: i === pieces.length - 1 ? part.ws : "" });
+    }
+  }
+  return units;
 }
 
 // ---------------------------------------------------------------------------

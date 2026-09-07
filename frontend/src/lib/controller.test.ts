@@ -163,6 +163,57 @@ describe("SyncController", () => {
     expect(getState().right.text).toBe("[One.] [Two edited.] [Three.]");
   });
 
+  it("editing a dense unpunctuated run resends only the touched chunk", async () => {
+    const { ctl, batches } = makeController();
+    const base = "x".repeat(1000);
+    ctl.edit("left", base);
+    await settle();
+    // Units are deduplicated by text: 400-char chunks + 200-char tail.
+    expect(batches[0]).toHaveLength(2);
+
+    // Append one character: only the last (changed) chunk is re-requested.
+    ctl.edit("left", base + "y");
+    await settle();
+    expect(batches.length).toBe(2);
+    expect(batches[1]).toHaveLength(1);
+    expect(batches[1][0].text.length).toBe(201); // tail chunk 200 -> 201
+  });
+
+  it("alignFor exposes exact per-sentence mapping after sync", async () => {
+    const { ctl, getState } = makeController();
+    ctl.edit("left", "One. Two. Three.");
+    await settle();
+    const alignment = ctl.alignFor("left");
+    expect(alignment).not.toBeNull();
+    expect(alignment!.srcSide).toBe("left");
+    const { rows } = alignment!;
+    expect(rows).toHaveLength(3);
+    // Rows cover the full source text and the full target text contiguously.
+    expect(rows[0].srcS).toBe(0);
+    expect(rows[rows.length - 1].srcE).toBe("One. Two. Three.".length);
+    expect(rows[0].dstS).toBe(0);
+    expect(rows[rows.length - 1].dstE).toBe(getState().right.text.length);
+    // Monotonic in both coordinate spaces.
+    for (let i = 1; i < rows.length; i++) {
+      expect(rows[i].srcS).toBeGreaterThanOrEqual(rows[i - 1].srcE);
+      expect(rows[i].dstS).toBeGreaterThanOrEqual(rows[i - 1].dstE);
+    }
+  });
+
+  it("alignFor returns null while the pair is not composed output", async () => {
+    const { ctl } = makeController();
+    ctl.edit("left", "Hello world.");
+    await settle();
+    expect(ctl.alignFor("left")).not.toBeNull();
+
+    // A restored session carries stale panes with no mapping yet.
+    ctl.restore(
+      { text: "Hello world.", lang: "auto", detected: "auto", busy: false },
+      { text: "[stale translation from an old session]", lang: "auto", detected: "auto", busy: false }
+    );
+    expect(ctl.alignFor("left")).toBeNull();
+  });
+
   it("is bidirectional: editing the right pane translates back to the left", async () => {
     const { ctl, getState } = makeController();
     ctl.edit("left", "你好，世界。");

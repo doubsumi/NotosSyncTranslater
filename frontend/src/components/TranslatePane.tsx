@@ -141,8 +141,8 @@ export function TranslatePane({
           ref={inputRef}
           value={pane.text}
           onChange={(e) => onEdit(e.target.value)}
-          onSelect={onUserSelection}
           onMouseUp={onUserSelection}
+          onClick={onUserSelection}
           placeholder={placeholder}
           spellCheck={false}
           autoCapitalize="off"

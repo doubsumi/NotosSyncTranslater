@@ -59,7 +59,9 @@ export class ApiError extends Error {
   }
 }
 
-const REQUEST_TIMEOUT_MS = 45_000;
+// One network wave of a translation may legitimately take a while when the
+// free upstreams are slow; keep it generous but bounded per request.
+const REQUEST_TIMEOUT_MS = 60_000;
 
 async function request<T>(
   path: string,
