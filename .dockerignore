@@ -1,0 +1,18 @@
+# Node
+frontend/node_modules
+frontend/dist
+frontend/.vite
+# Python
+backend/__pycache__
+backend/.pytest_cache
+backend/.cache
+**/__pycache__
+**/*.pyc
+# Git / misc
+.git
+.github
+.env
+*.log
+.DS_Store
+README.md
+LICENSE

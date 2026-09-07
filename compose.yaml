@@ -1,0 +1,19 @@
+services:
+  web:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      NST_PORT: "5000"
+      NST_HOST: "0.0.0.0"
+      NST_STATIC_DIR: /srv/frontend/dist
+      # Persistent translation-memory cache across restarts (optional).
+      NST_CACHE_DB: /data/tm.sqlite3
+      # Prefer a faster/safer provider set where applicable.
+      NST_PROVIDERS: bing,alibaba,sogou
+    volumes:
+      - cache-data:/data
+    restart: unless-stopped
+
+volumes:
+  cache-data:
