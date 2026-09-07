@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type Ref } from "react";
 import { computePair, type PaneState, type ProgressState } from "../lib/controller";
 import { detectLanguage, langLabel, type LangCode } from "../lib/detection";
 import { Icon } from "./Icon";
@@ -9,6 +9,10 @@ interface Props {
   other: PaneState;
   role: "source" | "target";
   progress: ProgressState | null;
+  /** DOM ref to the <textarea> (used for scroll + selection linking). */
+  inputRef?: Ref<HTMLTextAreaElement>;
+  /** Fired when the user changes the selection inside this pane. */
+  onUserSelection?: () => void;
   onEdit: (text: string) => void;
   onChangeLang: (lang: LangCode) => void;
   onToast: (kind: "success" | "error" | "info", message: string) => void;
@@ -43,6 +47,8 @@ export function TranslatePane({
   other,
   role,
   progress,
+  inputRef,
+  onUserSelection,
   onEdit,
   onChangeLang,
   onToast,
@@ -132,8 +138,11 @@ export function TranslatePane({
       <div className="pane-body">
         <textarea
           className="pane-input"
+          ref={inputRef}
           value={pane.text}
           onChange={(e) => onEdit(e.target.value)}
+          onSelect={onUserSelection}
+          onMouseUp={onUserSelection}
           placeholder={placeholder}
           spellCheck={false}
           autoCapitalize="off"

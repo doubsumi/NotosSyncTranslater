@@ -20,12 +20,32 @@ threads.
 from __future__ import annotations
 
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import translators as _ts  # the only third-party upstream client we use
+
+#: A suspiciously long unbroken alphanumeric run (no spaces) is the signature
+#: of a provider returning a session/hash placeholder instead of a real
+#: translation (observed on some free endpoints).
+_LONG_RUN_RE = re.compile(r"[A-Za-z0-9]{20,}")
+
+
+def _looks_plausible(source: str, result: str) -> bool:
+    """Reject obvious non-translations (hash-like noise) before caching."""
+    s = source.strip()
+    r = result.strip()
+    if not s or not r:
+        return False
+    if " " not in r and _LONG_RUN_RE.search(r):
+        # A single long token could be a real URL/identifier; only treat it as
+        # noise when it is not present in the source.
+        if s not in r and r not in s:
+            return False
+    return True
 
 
 class EngineError(Exception):
@@ -113,6 +133,8 @@ class Engine:
             elapsed = time.monotonic() - started
             if not isinstance(result, str) or not result:
                 raise ValueError("empty result")
+            if not _looks_plausible(text, result):
+                raise ValueError("implausible result (hash-like placeholder)")
             state.record_success(elapsed)
             return result
         except Exception as exc:  # noqa: BLE001 - upstreams fail in many ways

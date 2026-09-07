@@ -4,18 +4,23 @@
 // Guarantees implemented here (and unit-tested):
 //   1. Two-way editing: whatever pane the user types in becomes the source,
 //      the other pane follows.
-//   2. Debounce with max-wait (commercial typing behaviour) + abort of stale
-//      in-flight work: at most one request chain runs per burst and older
-//      results never clobber newer ones.
-//   3. Translation memory (TM): only blocks with no cached translation are
-//      ever sent to the server; unchanged/undone blocks resolve instantly.
-//   4. Whole documents are handled in bounded waves (no input length cap),
+//   2. Debounce (trailing pause + max-wait) with abort of stale work: at most
+//      one request chain runs per burst; older results never clobber newer.
+//   3. Sentence-level translation memory (TM): requests are scoped to the
+//      *sentence* the user changed — unchanged sentences and paragraphs are
+//      spliced from memory with zero network traffic (edit-here / update-here).
+//   4. Whole documents are processed in bounded waves (no input length cap),
 //      progressively filling the target pane with progress feedback.
 //   5. Results never overwrite text the user is actively editing; partial
 //      failures surface as retryable toasts, never as inline errors.
 // ---------------------------------------------------------------------------
 
-import { rebuildWithTranslations, splitBlocks } from "./blocks";
+import {
+  joinSentenceParts,
+  rebuildWithResolver,
+  splitBlocks,
+  splitSentences,
+} from "./blocks";
 import { defaultTargetFor, detectLanguage, type LangCode } from "./detection";
 import { debounce, type Debounced } from "./debounce";
 import { TranslationMemory } from "./tm";
@@ -67,15 +72,11 @@ export interface ControllerOptions {
   api: Api;
   onUpdate: (state: ControllerState) => void;
   onToast: (toast: ToastMessage) => void;
+  /** Trailing pause after the last keystroke before a request fires. */
   debounceMs?: number;
+  /** Guaranteed maximum wait while the user types continuously. */
   maxWaitMs?: number;
   waveSize?: number;
-}
-
-interface AppliedRecord {
-  srcText: string;
-  pair: Pair;
-  dstText: string;
 }
 
 const EMPTY_PANE = (): PaneState => ({
@@ -129,10 +130,6 @@ export class SyncController {
     progress: null,
   };
 
-  private applied: Record<Side, AppliedRecord | null> = {
-    left: null,
-    right: null,
-  };
   private generation = 0;
   private wave: WaveJob | null = null;
   private toastSeq = 0;
@@ -142,8 +139,11 @@ export class SyncController {
     this.api = opts.api;
     this.onUpdate = opts.onUpdate;
     this.onToast = opts.onToast;
-    this.waveSize = Math.min(Math.max(opts.waveSize ?? 10, 1), 64);
-    this.debounced = debounce(opts.debounceMs ?? 420, opts.maxWaitMs ?? 1500);
+    this.waveSize = Math.min(Math.max(opts.waveSize ?? 12, 1), 64);
+    // 800 ms after the last keystroke, at most every 2.6 s while typing
+    // continuously — long enough to batch a whole sentence, short enough to
+    // feel live.
+    this.debounced = debounce(opts.debounceMs ?? 800, opts.maxWaitMs ?? 2600);
   }
 
   // ------------------------------------------------------------------
@@ -170,24 +170,16 @@ export class SyncController {
           lang === "auto" ? this.refreshDetected(side, pane.text) : pane.detected,
       },
     }));
-    // The pair may have changed: forget applied translations so the next run
-    // re-syncs with the *new* direction.
-    this.applied.left = null;
-    this.applied.right = null;
     const active = this.state.active;
     if (active) this.runNow();
   }
 
   swap(): void {
     const s = this.state;
-    const nl: PaneState = { ...s.right, text: s.right.text, busy: false };
-    const nr: PaneState = { ...s.left, text: s.left.text, busy: false };
-    this.applied.left = null;
-    this.applied.right = null;
     this.setState((st) => ({
       ...st,
-      left: nl,
-      right: nr,
+      left: { ...s.right, busy: false },
+      right: { ...s.left, busy: false },
       active: "left",
       statusText: null,
       progress: null,
@@ -199,8 +191,6 @@ export class SyncController {
     this.cancelInflight();
     this.debounced.cancel();
     this.generation++;
-    this.applied.left = null;
-    this.applied.right = null;
     this.setState((s) => ({
       ...s,
       left: { ...s.left, text: "", detected: "auto", busy: false },
@@ -214,11 +204,10 @@ export class SyncController {
     }));
   }
 
-  /** Re-translate whatever is still missing (used by error-retry actions). */
+  /** Re-run synchronisation (used by error-retry toasts). */
   retry(): void {
     const active = this.state.active;
     if (!active) return;
-    this.applied[active] = null;
     this.runNow();
   }
 
@@ -226,16 +215,12 @@ export class SyncController {
   retranslateAll(): void {
     const active = this.state.active;
     if (!active) return;
-    this.applied.left = null;
-    this.applied.right = null;
     void this.run(true);
   }
 
   /** Load a previously persisted session without triggering translation. */
   restore(left: PaneState, right: PaneState): void {
     this.setState((s) => ({ ...s, left, right, active: null }));
-    this.applied.left = null;
-    this.applied.right = null;
   }
 
   dispose(): void {
@@ -276,7 +261,7 @@ export class SyncController {
     void this.run(false);
   }
 
-  /** Compute the current source text → target text synchronisation. */
+  /** Synchronise the current source pane → target pane. */
   private async run(force = false): Promise<void> {
     const active = this.state.active;
     if (!active) return;
@@ -297,7 +282,6 @@ export class SyncController {
 
     if (srcText.trim().length === 0) {
       if (target.text.length > 0) this.applyTo(dst, "");
-      this.applied[active] = null;
       this.setState((s) => ({
         ...s,
         phase: "idle",
@@ -315,35 +299,27 @@ export class SyncController {
       return; // cannot translate into "auto"
     }
 
-    // Fast path 1: exactly this request was already applied.
-    if (!force) {
-      const applied = this.applied[active];
-      if (
-        applied &&
-        applied.srcText === srcText &&
-        applied.pair.from === pair.from &&
-        applied.pair.to === pair.to
-      ) {
-        if (target.text !== applied.dstText) this.applyTo(dst, applied.dstText);
-        this.clearBusy();
-        return;
+    const blocks = splitBlocks(srcText);
+
+    // Collect the sentence parts that still lack a translation (the ONLY
+    // things we ever send to the server). Identical sentences anywhere in the
+    // document collapse into one request.
+    const missingTexts: string[] = [];
+    const seen = new Set<string>();
+    for (const content of blocks) {
+      for (const part of splitSentences(content)) {
+        const cached = !force && this.tm.get(pair.from, pair.to, part.text);
+        if (cached === undefined && !seen.has(part.text)) {
+          seen.add(part.text);
+          missingTexts.push(part.text);
+        }
       }
     }
 
-    const blocks = splitBlocks(srcText);
-    const translations = new Map<number, string>();
-    const missing: number[] = [];
-    blocks.forEach((b, i) => {
-      const cached = !force ? this.tm.get(pair.from, pair.to, b) : undefined;
-      if (cached !== undefined) translations.set(i, cached);
-      else missing.push(i);
-    });
-
-    // Fast path 2: translation memory covers everything (undo/redo, repeats).
-    if (!force && missing.length === 0) {
-      const dstText = rebuildWithTranslations(srcText, translations);
-      this.applyTo(dst, dstText);
-      this.applied[active] = { srcText, pair, dstText };
+    // Fast path: translation memory already covers every sentence.
+    if (missingTexts.length === 0) {
+      const out = this.assembleDoc(srcText, blocks, pair, null);
+      this.applyTo(dst, out.text);
       this.setState((s) => ({
         ...s,
         phase: "idle",
@@ -355,116 +331,143 @@ export class SyncController {
       return;
     }
 
-    await this.translateWaves({
+    await this.runSegmentWaves({
       active,
       dst,
       srcText,
-      pair,
       blocks,
-      translations,
-      missing,
-      noCache: force,
+      pair,
+      missingTexts,
+      force,
     });
   }
 
-  private async translateWaves(args: {
+  /**
+   * Rebuild the target document: for every source block, splice the sentence
+   * translations that are known; blocks with unknown sentences fall back to
+   * the currently displayed target block (or to the source text when there is
+   * no previous target yet).
+   */
+  private assembleDoc(
+    srcText: string,
+    blocks: string[],
+    pair: Pair,
+    fallbackTarget: string | null
+  ): { text: string; unresolved: number } {
+    const fbBlocks = fallbackTarget !== null ? splitBlocks(fallbackTarget) : null;
+    let unresolved = 0;
+    const resolved = rebuildWithResolver(srcText, (blockIdx, content) => {
+      const parts = splitSentences(content);
+      const translations: string[] = [];
+      for (const part of parts) {
+        const cached = this.tm.get(pair.from, pair.to, part.text);
+        if (cached === undefined) {
+          translations.length = 0;
+          break;
+        }
+        translations.push(cached);
+      }
+      if (translations.length === parts.length) {
+        // Smart spacing: avoid stray spaces between CJK segments.
+        return joinSentenceParts(parts, translations, true).replace(/\r?\n/g, " ");
+      }
+      unresolved++;
+      const fallback =
+        fbBlocks !== null && blockIdx < fbBlocks.length ? fbBlocks[blockIdx] : null;
+      return fallback ?? blocks[blockIdx];
+    });
+    return { text: resolved, unresolved };
+  }
+
+  private async runSegmentWaves(args: {
     active: Side;
     dst: Side;
     srcText: string;
-    pair: Pair;
     blocks: string[];
-    translations: Map<number, string>;
-    missing: number[];
-    noCache: boolean;
+    pair: Pair;
+    missingTexts: string[];
+    force: boolean;
   }): Promise<void> {
-    const { active, dst, srcText, pair, blocks, translations, missing, noCache } =
-      args;
+    const { active, dst, srcText, blocks, pair, missingTexts, force } = args;
     const gen = ++this.generation;
-    // Supersede any running translation chain.
     this.cancelInflight();
 
     const controller = new AbortController();
     this.wave = { gen, translator: controller };
     this.startedAt = performance.now();
 
-    const total = missing.length;
-    let done = 0;
+    const total = missingTexts.length;
     let okCount = 0;
-    let failedIds: string[] = [];
+    let failedTexts: string[] = [];
     let errorMessage = "";
     let lastProvider: string | null = null;
-    // What the target pane is expected to contain; only our own writes update
-    // it, so any real user edit blocks further overwrites.
     let expectedTarget = this.state[dst].text;
 
     this.setState((s) => ({
       ...s,
       phase: "translating",
-      statusText: total > 1 ? `正在翻译 0/${total} 段` : "正在翻译…",
+      statusText: total > 1 ? `正在翻译 0/${total} 句` : "正在翻译…",
       progress: { done: 0, total },
       [dst]: { ...s[dst], busy: true },
     }));
 
-    const indexToId = (blockIdx: number): string => `${gen}:${active}:${blockIdx}`;
+    const idFor = (index: number): string => `${gen}:${active}:${index}`;
 
     try {
-      for (let offset = 0; offset < missing.length; offset += this.waveSize) {
+      for (let offset = 0; offset < missingTexts.length; offset += this.waveSize) {
         if (this.generation !== gen) return; // superseded mid-flight
-        const slice = missing.slice(offset, offset + this.waveSize);
-        const items = slice.map((blockIdx) => ({
-          id: indexToId(blockIdx),
-          text: blocks[blockIdx],
+        const slice = missingTexts.slice(offset, offset + this.waveSize);
+        const items = slice.map((text, i) => ({
+          id: idFor(offset + i),
+          text,
           from: pair.from,
           to: pair.to,
-          noCache,
+          noCache: force,
         }));
 
         let results: BatchResult[];
         try {
           results = await this.api.translateBatch(items, controller.signal);
         } catch (err) {
-          // Network/HTTP level failure for the whole wave.
           errorMessage = err instanceof Error ? err.message : String(err);
-          failedIds = failedIds.concat(slice.map(indexToId));
+          failedTexts = failedTexts.concat(slice);
           if (this.generation !== gen) return;
           break;
         }
         if (this.generation !== gen) return; // aborted while awaiting
 
         const byId = new Map(results.map((r) => [r.id, r]));
-        for (const blockIdx of slice) {
-          const r = byId.get(indexToId(blockIdx));
+        slice.forEach((text, i) => {
+          const r = byId.get(idFor(offset + i));
           if (r && r.ok) {
-            translations.set(blockIdx, r.translated);
-            this.tm.set(pair.from, pair.to, blocks[blockIdx], r.translated);
+            this.tm.set(pair.from, pair.to, text, r.translated);
             okCount++;
             lastProvider = lastProvider ?? r.provider;
           } else {
-            failedIds.push(indexToId(blockIdx));
+            failedTexts.push(text);
             errorMessage = r && !r.ok ? r.error.message : errorMessage;
           }
-        }
-        done = okCount;
+        });
+
         this.setState((s) => ({
           ...s,
-          statusText: total > 1 ? `正在翻译 ${done}/${total} 段` : "正在翻译…",
-          progress: { done, total },
+          statusText:
+            total > 1 ? `正在翻译 ${okCount}/${total} 句` : "正在翻译…",
+          progress: { done: okCount, total },
         }));
 
         // Progressive fill: splice what we have into the target pane.
         const currentTarget = this.state[dst];
         if (this.state.active === active && currentTarget.text === expectedTarget) {
-          const assembled = rebuildWithTranslations(srcText, translations);
-          this.applyTo(dst, assembled);
-          expectedTarget = assembled;
+          const assembled = this.assembleDoc(srcText, blocks, pair, currentTarget.text);
+          this.applyTo(dst, assembled.text);
+          expectedTarget = assembled.text;
         }
       }
     } finally {
       if (this.generation === gen) {
         const elapsed = Math.round(performance.now() - this.startedAt);
-        const hasFailure = failedIds.length > 0;
-        const stillActive = this.state.active === active;
-        const ownTarget = this.state[dst].text === expectedTarget;
+        const hasFailure = failedTexts.length > 0;
         this.setState((s) => ({
           ...s,
           phase: "idle",
@@ -475,31 +478,22 @@ export class SyncController {
           statusText: hasFailure
             ? "部分内容翻译失败"
             : total > 1
-              ? `已同步 ${okCount} 段`
+              ? `已同步 ${okCount} 句`
               : lastProvider
                 ? `已由 ${lastProvider} 翻译 · ${elapsed} ms`
                 : null,
         }));
         if (hasFailure) {
-          // Keep the partial output visible and let the user retry via the
-          // toast (retry re-runs `run()` which only requests blocks that
-          // still lack a TM entry).
           this.onToast({
             id: ++this.toastSeq,
             kind: "error",
             message:
-              failedIds.length >= total
+              failedTexts.length >= total
                 ? errorMessage || "翻译失败，请重试"
-                : `有 ${failedIds.length} 段翻译失败，其余已同步`,
+                : `有 ${failedTexts.length} 句翻译失败，其余已同步`,
             actionLabel: "重试",
             onAction: () => this.retry(),
           });
-        } else if (stillActive && ownTarget) {
-          this.applied[active] = {
-            srcText,
-            pair,
-            dstText: this.state[dst].text,
-          };
         }
         this.wave = null;
       }

@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  blockRangeForSelection,
   changedRange,
   fnv1a,
+  joinSentenceParts,
   mapBlocks,
   rebuildWithTranslations,
   splitBlocks,
+  splitSentences,
 } from "./blocks";
 
 describe("splitBlocks / layout preservation", () => {
@@ -64,5 +67,60 @@ describe("fnv1a", () => {
     expect(fnv1a("hello")).toBe(fnv1a("hello"));
     expect(fnv1a("hello")).not.toBe(fnv1a("hello "));
     expect(fnv1a("中文")).not.toBe(fnv1a("中文 "));
+  });
+});
+
+describe("splitSentences", () => {
+  const identity = (block: string): boolean =>
+    block === joinSentenceParts(splitSentences(block), splitSentences(block).map((p) => p.text));
+
+  it("round-trips any block (text + ws reconstructs exactly)", () => {
+    for (const block of [
+      "One. Two. Three.",
+      "今天天气很好。我们去散步吧！",
+      "Hello world",
+      "A  B  C.",
+      "U.S. Army. Navy.",
+    ]) {
+      expect(identity(block)).toBe(true);
+    }
+  });
+
+  it("splits English sentences on real boundaries only", () => {
+    const parts = splitSentences("Mr. Smith went home. He walked away.");
+    expect(parts.map((p) => p.text)).toEqual([
+      "Mr. Smith went home.",
+      "He walked away.",
+    ]);
+  });
+
+  it("keeps abbreviations and decimals intact", () => {
+    expect(splitSentences("Pi is 3.14 and e.g. this one.").length).toBe(1);
+  });
+
+  it("splits CJK sentences with no whitespace", () => {
+    const parts = splitSentences("今天很好。明天也好。");
+    expect(parts.map((p) => p.text)).toEqual(["今天很好。", "明天也好。"]);
+    expect(parts.map((p) => p.ws)).toEqual(["", ""]);
+  });
+
+  it("preserves inter-sentence whitespace separately", () => {
+    const parts = splitSentences("One.  Two.");
+    expect(parts[0].ws).toBe("  ");
+  });
+});
+
+describe("blockRangeForSelection", () => {
+  it("maps a selection to its block range", () => {
+    const text = "alpha\nbeta\ngamma";
+    // 'bet' starts at offset 6, ends at 9 -> block index 1
+    expect(blockRangeForSelection(text, 6, 9)).toEqual([1, 1]);
+    // spanning alpha and beta
+    expect(blockRangeForSelection(text, 2, 9)).toEqual([0, 1]);
+  });
+
+  it("returns null for collapsed or empty selections", () => {
+    expect(blockRangeForSelection("abc\ndef", 1, 1)).toBeNull();
+    expect(blockRangeForSelection("", 0, 0)).toBeNull();
   });
 });

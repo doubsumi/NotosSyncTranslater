@@ -20,6 +20,7 @@ from typing import Any
 from . import detection as det
 from .cache import TranslationCache, cache_key
 from .engine import Engine, EngineError
+from .normalize import join_translated_chunks, normalize_translation
 from .segmentation import subchunk
 
 #: Language codes the API accepts (``auto`` allowed as source only).
@@ -159,10 +160,10 @@ class TranslationService:
         # 5. Assemble per-item results in request order.
         results: list[dict[str, Any]] = []
         for item, chunks, from_lang in prepared:
-            pieces: list[str] = []
             provider = "cache"
             cache_hits = 0
             error: dict[str, Any] | None = None
+            normalized: list[str] = []
             for chunk in chunks:
                 value = translated.get(chunk.key)
                 if value is None:
@@ -174,18 +175,25 @@ class TranslationService:
                         },
                     }
                     break
-                pieces.append(value)
+                # Unescape HTML entities (&lt; -> <) and keep every block on a
+                # single line so both panes keep a 1:1 block layout.
+                normalized.append(normalize_translation(value))
                 chunk_provider = provider_of.get(chunk.key, "cache")
                 if chunk_provider == "cache":
                     cache_hits += 1
                 else:
                     provider = chunk_provider  # last upstream provider wins
             if error is None:
+                translated_text = (
+                    join_translated_chunks([c.text for c in chunks], normalized)
+                    if chunks
+                    else ""
+                )
                 results.append(
                     {
                         "id": item.id,
                         "ok": True,
-                        "translated": "".join(pieces),
+                        "translated": translated_text,
                         "from": from_lang,
                         "to": item.to_lang,
                         "provider": provider,

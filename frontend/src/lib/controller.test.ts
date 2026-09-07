@@ -146,6 +146,23 @@ describe("SyncController", () => {
     expect(batches[1][0].text).toBe("second line EDITED");
   });
 
+  it("editing one sentence requests and updates only that sentence", async () => {
+    const { ctl, getState, batches } = makeController();
+    ctl.edit("left", "One. Two. Three.");
+    await settle();
+    expect(batches.length).toBe(1);
+    expect(batches[0].map((b) => b.text).sort()).toEqual(["One.", "Three.", "Two."]);
+    expect(getState().right.text).toBe("[One.] [Two.] [Three.]");
+
+    // Touch the middle sentence only.
+    ctl.edit("left", "One. Two edited. Three.");
+    await settle();
+    expect(batches.length).toBe(2);
+    expect(batches[1]).toHaveLength(1);
+    expect(batches[1][0].text).toBe("Two edited.");
+    expect(getState().right.text).toBe("[One.] [Two edited.] [Three.]");
+  });
+
   it("is bidirectional: editing the right pane translates back to the left", async () => {
     const { ctl, getState } = makeController();
     ctl.edit("left", "你好，世界。");
