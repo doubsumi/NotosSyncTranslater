@@ -65,7 +65,7 @@ class Config:
     """Runtime configuration. Customise via environment variables."""
 
     #: Host / port for ``python run.py``.
-    host: str = os.environ.get("NST_HOST", "0.0.0.0")
+    host: str = os.environ.get("NST_HOST", "127.0.0.1")
     port: int = _env_int("NST_PORT", 5000)
     debug: bool = _env_bool("NST_DEBUG", False)
 

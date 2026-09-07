@@ -1,7 +1,7 @@
 """Development / container entry point.
 
 Usage:
-    python run.py                     # host: 0.0.0.0 port: 5000
+    python run.py                     # host: 127.0.0.1 port: 5000
     python run.py --port 8000 --no-reload
 
 Prefers Waitress (production-grade, threaded) when installed and falls back
