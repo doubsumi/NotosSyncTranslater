@@ -180,8 +180,8 @@ export class SyncController {
 
   swap(): void {
     const s = this.state;
-    const nl: PaneState = { ...s.right, text: s.right.text };
-    const nr: PaneState = { ...s.left, text: s.left.text };
+    const nl: PaneState = { ...s.right, text: s.right.text, busy: false };
+    const nr: PaneState = { ...s.left, text: s.left.text, busy: false };
     this.applied.left = null;
     this.applied.right = null;
     this.setState((st) => ({
@@ -198,12 +198,13 @@ export class SyncController {
   clear(): void {
     this.cancelInflight();
     this.debounced.cancel();
+    this.generation++;
     this.applied.left = null;
     this.applied.right = null;
     this.setState((s) => ({
       ...s,
-      left: { ...s.left, text: "", detected: "auto" },
-      right: { ...s.right, text: "", detected: "auto" },
+      left: { ...s.left, text: "", detected: "auto", busy: false },
+      right: { ...s.right, text: "", detected: "auto", busy: false },
       active: null,
       phase: "idle",
       statusText: null,
@@ -255,6 +256,14 @@ export class SyncController {
     return text.trim().length > 0 ? detectLanguage(text).code : "auto";
   }
 
+  private clearBusy(): void {
+    this.setState((s) => ({
+      ...s,
+      left: { ...s.left, busy: false },
+      right: { ...s.right, busy: false },
+    }));
+  }
+
   private schedule(): void {
     this.debounced.cancel();
     this.debounced.schedule(() => {
@@ -271,13 +280,20 @@ export class SyncController {
   private async run(force = false): Promise<void> {
     const active = this.state.active;
     if (!active) return;
+    // Any still-running chain belongs to an older keystroke: cancel it and
+    // invalidate its generation so it can never apply or toast stale results.
+    this.cancelInflight();
+    this.generation++;
     const src = this.state[active];
     const dst = opposite(active);
     const target = this.state[dst];
     const srcText = src.text;
 
     // Nothing to translate when both panes already hold identical text.
-    if (srcText.length > 0 && target.text === srcText) return;
+    if (srcText.length > 0 && target.text === srcText) {
+      this.clearBusy();
+      return;
+    }
 
     if (srcText.trim().length === 0) {
       if (target.text.length > 0) this.applyTo(dst, "");
@@ -287,12 +303,17 @@ export class SyncController {
         phase: "idle",
         statusText: null,
         progress: null,
+        left: { ...s.left, busy: false },
+        right: { ...s.right, busy: false },
       }));
       return;
     }
 
     const pair = computePair(src, target, srcText);
-    if (pair.to === "auto") return; // cannot translate into "auto"
+    if (pair.to === "auto") {
+      this.clearBusy();
+      return; // cannot translate into "auto"
+    }
 
     // Fast path 1: exactly this request was already applied.
     if (!force) {
@@ -304,6 +325,7 @@ export class SyncController {
         applied.pair.to === pair.to
       ) {
         if (target.text !== applied.dstText) this.applyTo(dst, applied.dstText);
+        this.clearBusy();
         return;
       }
     }
@@ -327,6 +349,8 @@ export class SyncController {
         phase: "idle",
         statusText: "已从记忆恢复",
         progress: null,
+        left: { ...s.left, busy: false },
+        right: { ...s.right, busy: false },
       }));
       return;
     }
@@ -445,6 +469,8 @@ export class SyncController {
           ...s,
           phase: "idle",
           progress: null,
+          left: { ...s.left, busy: false },
+          right: { ...s.right, busy: false },
           provider: hasFailure ? s.provider : lastProvider ?? s.provider,
           statusText: hasFailure
             ? "部分内容翻译失败"
@@ -485,7 +511,7 @@ export class SyncController {
     if (pane.text === text) return;
     this.setState((s) => ({
       ...s,
-      [dst]: { ...pane, text, busy: false },
+      [dst]: { ...pane, text },
       statusText: s.statusText,
     }));
   }

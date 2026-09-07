@@ -51,6 +51,49 @@ function makeController(
   return { ctl, getState: () => latest!, batches };
 }
 
+/** API whose batch promises resolve only when the test says so. */
+function manualApi() {
+  const pending: Array<{
+    items: BatchItem[];
+    resolve: (r: BatchResult[]) => void;
+  }> = [];
+  const api = {
+    translateBatch(items: BatchItem[]): Promise<BatchResult[]> {
+      return new Promise<BatchResult[]>((resolve) => {
+        pending.push({ items, resolve });
+      });
+    },
+    async detect(_text: string) {
+      return { lang: "auto" as const, confidence: 0, script: "other", analyzedChars: 0 };
+    },
+    async health() {
+      return { status: "ok", providers: [] };
+    },
+  };
+  return {
+    api,
+    get pendingCount(): number {
+      return pending.length;
+    },
+    resolveAll(): void {
+      const queue = pending.splice(0);
+      for (const p of queue) {
+        p.resolve(
+          p.items.map((item) => ({
+            id: item.id,
+            ok: true as const,
+            translated: `[${item.text}]`,
+            from: item.from,
+            to: item.to,
+            provider: "fake",
+            cacheHits: 0,
+          }))
+        );
+      }
+    },
+  };
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
 });
@@ -153,5 +196,35 @@ describe("SyncController", () => {
     await settle();
     const last = batches[batches.length - 1];
     expect(last[0].to).toBe("ja");
+  });
+
+  it("superseded chains never apply or toast stale results", async () => {
+    const manual = manualApi();
+    const toasts: unknown[] = [];
+    let latest: ControllerState | null = null;
+    const ctl = new SyncController({
+      api: manual.api,
+      debounceMs: 200,
+      maxWaitMs: 800,
+      onUpdate: (s) => {
+        latest = s;
+      },
+      onToast: (t) => toasts.push(t),
+    });
+
+    ctl.edit("left", "first draft");
+    await settle(); // first chain starts and stays in flight
+    expect(manual.pendingCount).toBe(1);
+
+    // The user keeps typing while the request is flying.
+    ctl.edit("left", "second draft");
+    await settle(); // new debounce burst supersedes the old chain
+
+    // Now let everything settle: the old response must be discarded.
+    manual.resolveAll();
+    await settle();
+
+    expect(latest!.right.text).toBe("[second draft]");
+    expect(toasts).toEqual([]); // no bogus "translation failed" popup
   });
 });

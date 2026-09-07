@@ -42,6 +42,7 @@ export function useSyncTranslate(): {
   const [state, setState] = useState<ControllerState>(EMPTY_STATE);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const controllerRef = useRef<SyncController | null>(null);
+  const restoredRef = useRef(false);
   const toastSeqRef = useRef(0);
 
   const pushToast = useCallback(
@@ -65,8 +66,10 @@ export function useSyncTranslate(): {
     controllerRef.current = controller;
 
     // Restore the previous session silently (no automatic re-translation).
-    const saved = loadSession();
+    // StrictMode remounts effects in dev; only restore once.
+    const saved = !restoredRef.current ? loadSession() : null;
     if (saved) {
+      restoredRef.current = true;
       controller.restore(
         { text: saved.left.text, lang: saved.left.lang, detected: "auto", busy: false },
         { text: saved.right.text, lang: saved.right.lang, detected: "auto", busy: false }

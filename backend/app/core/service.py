@@ -121,7 +121,9 @@ class TranslationService:
                     to_lang=to_lang,
                     no_cache=item.no_cache,
                 )
+                # Empty text never reaches an upstream provider.
                 for text in subchunk(item.text, self.split_block_chars)
+                if text
             ]
             prepared.append((item, chunks, from_lang))
 
