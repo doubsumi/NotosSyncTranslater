@@ -292,6 +292,34 @@ body {
   flex: 1;
   min-height: 0;
   display: flex;
+  overflow: hidden;
+}
+
+/* CodeMirror editor surfaces */
+.cm-host {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+.cm-host .cm-editor {
+  height: 100%;
+  font-family: var(--font-sans);
+}
+
+.cm-placeholder {
+  position: absolute;
+  top: 12px;
+  left: 18px;
+  right: 18px;
+  color: var(--text-3);
+  font-size: 15px;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .pane-input {

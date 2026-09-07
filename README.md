@@ -44,16 +44,17 @@
 │   │   └── config.py             # 全部可配（NST_* 环境变量）
 │   ├── tests/                    # pytest（无网络单元测试 + 可选 live 冒烟）
 │   └── run.py                    # 入口（优先 waitress）
-├── frontend/                # React 18 + TypeScript + Vite
+├── frontend/                # React 18 + TypeScript + Vite · 编辑器内核 CodeMirror 6
 │   └── src/
 │       ├── lib/
-│       │   ├── controller.ts     # SyncController：双向同步状态机（核心，纯 TS 可测）
+│       │   ├── controller.ts     # SyncController：双向同步状态机 + 有界单元增量（核心，纯 TS 可测）
 │       │   ├── debounce.ts       # 防抖(max-wait) / 速率门
-│       │   ├── blocks.ts         # 块/句子切分、布局保持重建、选区映射
-│       │   ├── tm.ts             # 会话级句子翻译记忆（LRU）
+│       │   ├── blocks.ts         # 块/句子/有界单元切分、组装、选区映射
+│       │   ├── tm.ts             # 会话级单元翻译记忆（LRU）
+│       │   ├── cm.ts             # CodeMirror 扩展：装饰高亮/外部回写/主题
 │       │   ├── detection.ts      # 语言/自动配对规则（与服务端一致）
 │       │   └── api.ts            # 类型化 API 客户端（超时/取消）
-│       ├── components/           # 输入面板、语言选择、Toast 等
+│       ├── components/           # CodePaneInput(CM6)、面板、语言选择、Toast 等
 │       └── hooks/useSyncTranslate.ts
 ├── Dockerfile / compose.yaml / .github/workflows/
 └── .env.example
@@ -108,6 +109,7 @@ NST_LIVE_TESTS=1 python -m pytest -m "" tests/test_live.py   # 或 cd backend &&
 - **会话记忆**：文本与语言选择自动持久化（localStorage，节流保存），刷新后恢复并提示。
 - **错误即弹窗**：网络失败、引擎全部不可用等均以 Toast 呈现，可一键重试；绝不把错误文本写进输入框。
 - **无障碍**：区域 role/aria-live、键盘可达、深浅色自动适配、焦点可见。
+- **编辑器内核**：双栏基于 CodeMirror 6——译文/原文句级高亮、光标句框选等均用原生 decorations 实现（替代 textarea 选区的脆弱做法），为后续“句级底色、术语着色、行级标注、富文本粘贴”等复杂效果铺路；输入/回写通过显式标注区分，绝无编辑回环。
 
 ## 后端算法设计（优雅性 / 开销 / 鲁棒性）
 

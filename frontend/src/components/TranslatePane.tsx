@@ -1,6 +1,17 @@
-import { useMemo, useState, type Ref } from "react";
-import { computePair, type PaneState, type ProgressState } from "../lib/controller";
-import { detectLanguage, langLabel, type LangCode } from "../lib/detection";
+import { EditorView } from "@codemirror/view";
+import { useMemo, useState } from "react";
+import {
+  computePair,
+  type PaneState,
+  type ProgressState,
+} from "../lib/controller";
+import {
+  detectLanguage,
+  langLabel,
+  type LangCode,
+} from "../lib/detection";
+import type { TextRange } from "../lib/cm";
+import { CodePaneInput } from "./CodePaneInput";
 import { Icon } from "./Icon";
 import { LanguageSelect } from "./LanguageSelect";
 
@@ -9,10 +20,12 @@ interface Props {
   other: PaneState;
   role: "source" | "target";
   progress: ProgressState | null;
-  /** DOM ref to the <textarea> (used for scroll + selection linking). */
-  inputRef?: Ref<HTMLTextAreaElement>;
-  /** Fired when the user changes the selection inside this pane. */
-  onUserSelection?: () => void;
+  /** Counterpart-sentence highlight (decoration range inside this pane). */
+  link: TextRange | null;
+  /** Transient self-sentence highlight while the user places a caret. */
+  flash: TextRange | null;
+  onViewReady: (view: EditorView | null) => void;
+  onPointer: () => void;
   onEdit: (text: string) => void;
   onChangeLang: (lang: LangCode) => void;
   onToast: (kind: "success" | "error" | "info", message: string) => void;
@@ -47,8 +60,10 @@ export function TranslatePane({
   other,
   role,
   progress,
-  inputRef,
-  onUserSelection,
+  link,
+  flash,
+  onViewReady,
+  onPointer,
   onEdit,
   onChangeLang,
   onToast,
@@ -56,7 +71,11 @@ export function TranslatePane({
 }: Props): JSX.Element {
   const [copied, setCopied] = useState(false);
   const pair = useMemo(
-    () => computePair(role === "source" ? pane : other, role === "source" ? other : pane),
+    () =>
+      computePair(
+        role === "source" ? pane : other,
+        role === "source" ? other : pane
+      ),
     [pane, other, role]
   );
   const detected =
@@ -67,7 +86,9 @@ export function TranslatePane({
   const lines = useMemo(() => {
     if (chars === 0) return 0;
     let n = 0;
-    for (let i = 0; i < pane.text.length; i++) if (pane.text.charCodeAt(i) === 10) n++;
+    for (let i = 0; i < pane.text.length; i++) {
+      if (pane.text.charCodeAt(i) === 10) n++;
+    }
     return n + 1;
   }, [pane.text, chars]);
 
@@ -87,12 +108,7 @@ export function TranslatePane({
   };
 
   const busy = pane.busy;
-  const placeholder =
-    role === "source"
-      ? "在此输入或粘贴要翻译的内容…（自动识别语言）"
-      : pane.text.length > 0
-        ? ""
-        : "译文将实时显示在这里…";
+  const placeholderHint = role === "source" ? "输入或粘贴要翻译的内容" : "译文将显示在这里";
 
   return (
     <section
@@ -136,24 +152,25 @@ export function TranslatePane({
       </header>
 
       <div className="pane-body">
-        <textarea
-          className="pane-input"
-          ref={inputRef}
+        <CodePaneInput
           value={pane.text}
-          onChange={(e) => onEdit(e.target.value)}
-          onMouseUp={onUserSelection}
-          onClick={onUserSelection}
-          placeholder={placeholder}
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          aria-label={role === "source" ? "源文本编辑区" : "译文编辑区"}
+          link={link}
+          flash={flash}
+          ariaLabel={role === "source" ? "源文本编辑区" : "译文编辑区"}
+          onUserEdit={onEdit}
+          onPointer={onPointer}
+          onViewReady={onViewReady}
         />
+        {pane.text.length === 0 && (
+          <div className="cm-placeholder" aria-hidden="true">
+            {placeholderHint}
+          </div>
+        )}
         {role === "target" && busy && (
           <div className="busy-overlay" aria-hidden="true">
             <span className="spinner" />
             {progress && progress.total > 1
-              ? `正在翻译 ${progress.done}/${progress.total} 段`
+              ? `正在翻译 ${progress.done}/${progress.total} 句`
               : "正在翻译…"}
           </div>
         )}
