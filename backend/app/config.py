@@ -92,6 +92,11 @@ class Config:
     #: Optional SQLite-backed persistent layer for the cache (empty = off).
     cache_db_path: str = os.environ.get("NST_CACHE_DB", "")
 
+    #: Per-document segment queue (live editor incremental sync).
+    segqueue_ttl: float = _env_float("NST_SEGQUEUE_TTL", 1800.0)  # seconds
+    segqueue_max_docs: int = _env_int("NST_SEGQUEUE_MAX_DOCS", 128)
+    segqueue_max_segments: int = _env_int("NST_SEGQUEUE_MAX_SEGMENTS", 20_000)
+
     #: Longest single chunk sent to an upstream provider. Any text longer than
     #: this is split at sentence boundaries first, so there is *no* upper
     #: input limit while every upstream call stays bounded.

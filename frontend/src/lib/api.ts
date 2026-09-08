@@ -106,6 +106,24 @@ export interface Api {
   translateBatch(items: BatchItem[], signal?: AbortSignal): Promise<BatchResult[]>;
   detect(text: string): Promise<DetectResult>;
   health(): Promise<HealthInfo>;
+  /** Incremental per-document segment sync (live editor). */
+  syncDocSegments(
+    doc: string,
+    from: LangCode,
+    to: LangCode,
+    items: Array<{ sid: number; text: string }>,
+    alive: number[],
+    signal?: AbortSignal
+  ): Promise<SegSyncResult[]>;
+}
+
+export interface SegSyncResult {
+  sid: number;
+  ok: boolean;
+  translated?: string;
+  provider?: string;
+  cache?: boolean;
+  error?: { code: string; message: string };
 }
 
 export function createApi(basePath = "/api"): Api {
@@ -114,6 +132,13 @@ export function createApi(basePath = "/api"): Api {
       const payload = await request<{ results: BatchResult[] }>(
         `${basePath}/translate/batch`,
         { method: "POST", body: JSON.stringify({ items }), signal }
+      );
+      return payload.results;
+    },
+    async syncDocSegments(doc, from, to, items, alive, signal): Promise<SegSyncResult[]> {
+      const payload = await request<{ results: SegSyncResult[] }>(
+        `${basePath}/docs/${encodeURIComponent(doc)}/segments/sync`,
+        { method: "POST", body: JSON.stringify({ from, to, items, alive }), signal }
       );
       return payload.results;
     },

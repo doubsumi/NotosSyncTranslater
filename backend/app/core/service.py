@@ -103,6 +103,23 @@ class TranslationService:
         return result
 
     # ------------------------------------------------------------------
+    def ensure_translated(self, text: str, from_lang: str, to_lang: str) -> tuple[str, str]:
+        """Translate a single sentence for the segment queue.
+
+        Consults the translation memory first; only cache misses hit an
+        upstream provider. Returns ``(normalized_translation, provider)``.
+        """
+        resolved_from = resolve_source(from_lang, text)
+        resolved_to = validate_lang(to_lang, allow_auto=False)
+        cached = self.cache.get(resolved_from, resolved_to, text)
+        if cached is not None:
+            return normalize_translation(cached), "cache"
+        value, provider = self.engine.translate_one(text, resolved_from, resolved_to)
+        normalized = normalize_translation(value)
+        self.cache.set(resolved_from, resolved_to, text, normalized)
+        return normalized, provider
+
+    # ------------------------------------------------------------------
     def translate_batch(self, items: list[Item]) -> list[dict[str, Any]]:
         """Translate a batch with parallel upstream calls and per-item
         failure isolation. Results are returned in request order."""

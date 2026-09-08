@@ -84,6 +84,7 @@ def health():  # noqa: ANN201
             "config": cfg.to_json(),
             "providers": engine.provider_status,
             "cache": {"entries": svc.cache.size},
+            "segQueue": current_app.extensions["nst_segqueue"].stats(),
         }
     )
 
@@ -162,6 +163,70 @@ def translate_batch():  # noqa: ANN201
     results = svc.translate_batch(items)
     return jsonify(
         {
+            "results": results,
+            "elapsedMs": round((time.perf_counter() - started) * 1000),
+        }
+    )
+
+
+@api.post("/docs/<doc_id>/segments/sync")
+def doc_segments_sync(doc_id: str):  # noqa: ANN201
+    """Incremental segment sync used by the live editor.
+
+    The frontend owns a per-pane document queue keyed by ``doc_id`` and edits
+    it *one sentence at a time*: the request carries only the changed
+    sentences (``items: [{sid, text}]``) plus the full list of currently alive
+    ``sids`` so deleted/re-ordered sentences are pruned on the server.
+    """
+    if not doc_id or len(doc_id) > 128 or not all(
+        ch.isalnum() or ch in "-_" for ch in doc_id
+    ):
+        raise ApiError(400, "BAD_DOC_ID", "invalid document id")
+    payload = _body()
+    from_lang = str(payload.get("from", "auto")).lower()
+    to_lang = str(payload.get("to", "")).lower()
+    try:
+        validate_lang(from_lang, allow_auto=True)
+        validate_lang(to_lang, allow_auto=False)
+    except ValueError as exc:
+        raise ApiError(422, "BAD_LANGUAGE", str(exc)) from exc
+
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ApiError(400, "BAD_REQUEST", "'items' must be a non-empty array")
+    if len(raw_items) > 2000:
+        raise ApiError(400, "BAD_REQUEST", "too many segments in one sync")
+    items: list[dict] = []
+    for index, raw in enumerate(raw_items):
+        if not isinstance(raw, dict):
+            raise ApiError(400, "BAD_REQUEST", f"items[{index}] must be an object")
+        sid = raw.get("sid")
+        text = raw.get("text")
+        if not isinstance(sid, int) or sid < 0:
+            raise ApiError(400, "BAD_REQUEST", f"items[{index}].sid must be a non-negative int")
+        if not isinstance(text, str) or not text:
+            raise ApiError(400, "BAD_REQUEST", f"items[{index}].text must be a non-empty string")
+        if len(text) > 8000:
+            raise ApiError(400, "BAD_REQUEST", f"items[{index}].text too long")
+        items.append({"sid": sid, "text": text})
+
+    raw_alive = payload.get("alive")
+    alive: list[int] | None = None
+    if raw_alive is not None:
+        if (
+            not isinstance(raw_alive, list)
+            or len(raw_alive) > 20_000
+            or any(not isinstance(s, int) or s < 0 for s in raw_alive)
+        ):
+            raise ApiError(400, "BAD_REQUEST", "'alive' must be a list of non-negative ints")
+        alive = list(raw_alive)
+
+    queue = current_app.extensions["nst_segqueue"]
+    started = time.perf_counter()
+    results = queue.sync_segments(doc_id, from_lang, to_lang, items, alive)
+    return jsonify(
+        {
+            "doc": doc_id,
             "results": results,
             "elapsedMs": round((time.perf_counter() - started) * 1000),
         }

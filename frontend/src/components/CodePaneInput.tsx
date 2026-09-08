@@ -9,7 +9,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { useEffect, useRef } from "react";
 import {
-  applyDocExternally,
+  applyDocPatchExternally,
   baseEditorExtensions,
   isExternal,
   setFlashHighlight,
@@ -74,7 +74,7 @@ export function CodePaneInput(props: CodePaneInputProps): JSX.Element {
     const view = viewRef.current;
     if (!view) return;
     if (view.state.doc.toString() !== props.value) {
-      applyDocExternally(view, props.value);
+      applyDocPatchExternally(view, props.value);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.value]);

@@ -48,6 +48,32 @@ export function applyDocExternally(view: EditorView, next: string): void {
   });
 }
 
+/**
+ * Apply a programmatic value change as the *minimal* document edit (shared
+ * prefix/suffix kept). When only one sentence flipped, CodeMirror receives a
+ * transaction that touches exactly that sentence's range — nothing else
+ * re-renders, and scroll/undo granularity stay natural.
+ */
+export function applyDocPatchExternally(view: EditorView, next: string): void {
+  const cur = view.state.doc.toString();
+  if (cur === next) return;
+  const n = cur.length;
+  const m = next.length;
+  let lo = 0;
+  while (lo < n && lo < m && cur.charCodeAt(lo) === next.charCodeAt(lo)) lo++;
+  let hiN = n;
+  let hiM = m;
+  while (hiN > lo && hiM > lo && cur.charCodeAt(hiN - 1) === next.charCodeAt(hiM - 1)) {
+    hiN--;
+    hiM--;
+  }
+  view.dispatch({
+    changes: { from: lo, to: hiN, insert: next.slice(lo, hiM) },
+    annotations: externalTag.of(true),
+    scrollIntoView: false,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Decoration fields: one per visual role (link = counterpart, flash = self).
 // ---------------------------------------------------------------------------

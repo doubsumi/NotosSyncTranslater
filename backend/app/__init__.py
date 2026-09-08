@@ -20,6 +20,7 @@ from .api.routes import api
 from .config import Config
 from .core.cache import TranslationCache
 from .core.engine import Engine
+from .core.segdoc import SegmentQueue
 from .core.service import TranslationService
 
 
@@ -121,10 +122,17 @@ def create_app(config: Config | None = None) -> Flask:
         split_block_chars=cfg.server_split_block_chars,
         max_parallel=cfg.provider_max_workers,
     )
+    segqueue = SegmentQueue(
+        ensure_fn=service.ensure_translated,
+        ttl_seconds=cfg.segqueue_ttl,
+        max_docs=cfg.segqueue_max_docs,
+        max_segments_per_doc=cfg.segqueue_max_segments,
+    )
     app.extensions["nst_config"] = cfg
     app.extensions["nst_engine"] = engine
     app.extensions["nst_cache"] = cache
     app.extensions["nst_service"] = service
+    app.extensions["nst_segqueue"] = segqueue
 
     # ---- routes ------------------------------------------------------------
     app.register_blueprint(api)
