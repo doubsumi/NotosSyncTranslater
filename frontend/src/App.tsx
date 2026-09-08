@@ -279,7 +279,6 @@ export default function App(): JSX.Element {
 
         <div className="header-tools">
           <div className="status-pill" role="status" aria-live="polite">
-            {busy && <span className="spinner spinner-sm" aria-hidden="true" />}
             <span className="status-text">
               {busy
                 ? state.progress && state.progress.total > 1
@@ -328,7 +327,6 @@ export default function App(): JSX.Element {
             pane={state.left}
             other={otherOf("left")}
             role={roleFor("left")}
-            progress={state.progress}
             link={link.left}
             flash={flash.left}
             onViewReady={registerView("left")}
@@ -347,7 +345,6 @@ export default function App(): JSX.Element {
             pane={state.right}
             other={otherOf("right")}
             role={roleFor("right")}
-            progress={state.progress}
             link={link.right}
             flash={flash.right}
             onViewReady={registerView("right")}

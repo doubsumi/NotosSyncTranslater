@@ -112,8 +112,8 @@ class Config:
     )
 
     #: Per-IP token-bucket limits protecting the free upstreams.
-    rate_limit_per_minute: int = _env_int("NST_RATE_LIMIT_PER_MIN", 240)
-    rate_limit_burst: int = _env_int("NST_RATE_LIMIT_BURST", 30)
+    rate_limit_per_minute: int = _env_int("NST_RATE_LIMIT_PER_MIN", 600)
+    rate_limit_burst: int = _env_int("NST_RATE_LIMIT_BURST", 90)
 
     #: Cap on a single request body (bytes). Generous: documents are split
     #: into chunks before they ever reach a provider, so 8 MB still means

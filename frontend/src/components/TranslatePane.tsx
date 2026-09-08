@@ -1,10 +1,6 @@
 import { EditorView } from "@codemirror/view";
 import { useMemo, useState } from "react";
-import {
-  computePair,
-  type PaneState,
-  type ProgressState,
-} from "../lib/controller";
+import { computePair, type PaneState } from "../lib/controller";
 import {
   detectLanguage,
   langLabel,
@@ -19,7 +15,6 @@ interface Props {
   pane: PaneState;
   other: PaneState;
   role: "source" | "target";
-  progress: ProgressState | null;
   /** Counterpart-sentence highlight (decoration range inside this pane). */
   link: TextRange | null;
   /** Transient self-sentence highlight while the user places a caret. */
@@ -59,7 +54,6 @@ export function TranslatePane({
   pane,
   other,
   role,
-  progress,
   link,
   flash,
   onViewReady,
@@ -107,12 +101,25 @@ export function TranslatePane({
     }
   };
 
-  const busy = pane.busy;
-  const placeholderHint = role === "source" ? "输入或粘贴要翻译的内容" : "译文将显示在这里";
+  const placeholderHint =
+    role === "source" ? "输入或粘贴要翻译的内容" : "译文将显示在这里";
+
+  // Effective language of THIS pane's content (explicit selection wins, then
+  // the detection result, then the resolved pair target).
+  const effectivePaneLang: LangCode =
+    pane.lang !== "auto"
+      ? pane.lang
+      : role === "source"
+        ? detected !== "auto"
+          ? detected
+          : "auto"
+        : pair.to !== "auto"
+          ? pair.to
+          : "auto";
 
   return (
     <section
-      className={`pane pane-${role}${busy ? " is-busy" : ""}`}
+      className={`pane pane-${role}`}
       aria-label={role === "source" ? "源语言输入框" : "译文输出框"}
     >
       <header className="pane-header">
@@ -125,6 +132,14 @@ export function TranslatePane({
             onChange={onChangeLang}
             ariaLabel={role === "source" ? "源语言" : "目标语言"}
           />
+          <span
+            className="pane-lang-tag"
+            title="本侧内容的语言（保持单一语言，不会与另一侧混排）"
+          >
+            {effectivePaneLang === "auto"
+              ? "语言未定"
+              : `本侧：${langLabel(effectivePaneLang)}`}
+          </span>
           {role === "source" && pane.lang === "auto" && detected !== "auto" && (
             <span className="detect-chip" title="已自动识别到的语言">
               已检测：{langLabel(detected)}
@@ -140,13 +155,17 @@ export function TranslatePane({
         {role === "target" && (
           <div className="pane-hint">
             {pane.lang === "auto"
-              ? `将译成：${pair.to !== "auto" ? langLabel(pair.to) : "自动"}`
-              : `目标语言：${langLabel(pane.lang)}`}
+              ? `译文语言：${pair.to !== "auto" ? langLabel(pair.to) : "自动"} · 源自 ${
+                  detected !== "auto" ? langLabel(detected) : "原文"
+                }`
+              : `译文语言：${langLabel(pane.lang)} · 源自原文`}
           </div>
         )}
         {role === "source" && (
           <div className="pane-hint">
-            {pair.to !== "auto" ? `原文 → ${langLabel(pair.to)}` : "请先输入内容"}
+            {pair.to !== "auto"
+              ? `原文语言：${langLabel(effectivePaneLang)} → 译成 ${langLabel(pair.to)}`
+              : "请先输入内容"}
           </div>
         )}
       </header>
@@ -164,14 +183,6 @@ export function TranslatePane({
         {pane.text.length === 0 && (
           <div className="cm-placeholder" aria-hidden="true">
             {placeholderHint}
-          </div>
-        )}
-        {role === "target" && busy && (
-          <div className="busy-overlay" aria-hidden="true">
-            <span className="spinner" />
-            {progress && progress.total > 1
-              ? `正在翻译 ${progress.done}/${progress.total} 句`
-              : "正在翻译…"}
           </div>
         )}
       </div>

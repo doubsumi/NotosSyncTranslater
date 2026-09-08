@@ -2,21 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SyncController, type ControllerState } from "./controller";
 import type { SegSyncResult } from "./api";
 
-// ---------------------------------------------------------------------------
-// Fake backends implementing the segment queue protocol.
-// ---------------------------------------------------------------------------
-interface SegmentCall {
+interface Call {
   doc: string;
   from: string;
   to: string;
   items: Array<{ sid: number; text: string }>;
   alive: number[];
+}
+
+interface PendingCall extends Call {
   resolve: (r: SegSyncResult[]) => void;
 }
 
 function makeApi(manual = false) {
-  const calls: Array<Omit<SegmentCall, "resolve">> = [];
-  const pending: SegmentCall[] = [];
+  const calls: Call[] = [];
+  const pending: PendingCall[] = [];
   const api = {
     async syncDocSegments(
       doc: string,
@@ -27,45 +27,30 @@ function makeApi(manual = false) {
       _signal?: AbortSignal
     ): Promise<SegSyncResult[]> {
       calls.push({ doc, from, to, items, alive });
-      if (!manual) {
-        return Promise.resolve(
-          items.map((item) => ({
-            sid: item.sid,
-            ok: true as const,
-            translated: `[${item.text}]`,
-            provider: "fake",
-          }))
-        );
-      }
-      return new Promise<SegSyncResult[]>((resolve) => {
+      const wrap = (items: Array<{ sid: number; text: string }>): SegSyncResult[] =>
+        items.map((i) => ({
+          sid: i.sid,
+          ok: true as const,
+          translated: `[${i.text}]`,
+          provider: "fake",
+        }));
+      if (!manual) return Promise.resolve(wrap(items));
+      return new Promise((resolve) => {
         pending.push({ doc, from, to, items, alive, resolve });
       });
     },
     translateBatch: async () => [],
-    detect: async () => ({
-      lang: "auto" as const,
-      confidence: 0,
-      script: "other",
-      analyzedChars: 0,
-    }),
+    detect: async () => ({ lang: "auto" as const, confidence: 0, script: "other", analyzedChars: 0 }),
     health: async () => ({ status: "ok", providers: [] }),
   };
   return {
     api,
     calls,
     pending,
-    resolveNext(results?: SegSyncResult[]) {
-      const call = pending.shift();
-      if (!call) throw new Error("no pending segment call");
-      const res =
-        results ??
-        call.items.map((item) => ({
-          sid: item.sid,
-          ok: true as const,
-          translated: `[${item.text}]`,
-          provider: "fake",
-        }));
-      call.resolve(res);
+    resolveNext() {
+      const p = pending.shift();
+      if (!p) throw new Error("no pending call");
+      p.resolve(p.items.map((i) => ({ sid: i.sid, ok: true as const, translated: `[${i.text}]`, provider: "fake" })));
     },
   };
 }
@@ -73,19 +58,19 @@ function makeApi(manual = false) {
 interface Ctx {
   ctl: SyncController;
   getState: () => ControllerState;
-  calls: ReturnType<typeof makeApi>["calls"];
-  pending: ReturnType<typeof makeApi>["pending"];
-  resolveNext: ReturnType<typeof makeApi>["resolveNext"];
+  calls: Call[];
+  pending: PendingCall[];
+  resolveNext: () => void;
   toasts: unknown[];
 }
 
-function makeController(opts: { debounceMs?: number; manual?: boolean } = {}): Ctx {
-  const backend = makeApi(Boolean(opts.manual));
+function makeController(manual = false): Ctx {
+  const backend = makeApi(manual);
   let latest: ControllerState | null = null;
   const toasts: unknown[] = [];
   const ctl = new SyncController({
     api: backend.api as never,
-    debounceMs: opts.debounceMs ?? 200,
+    debounceMs: 200,
     maxWaitMs: 800,
     concurrency: 3,
     onUpdate: (s) => {
@@ -103,135 +88,118 @@ function makeController(opts: { debounceMs?: number; manual?: boolean } = {}): C
   };
 }
 
-beforeEach(() => {
-  vi.useFakeTimers();
-});
-afterEach(() => {
-  vi.useRealTimers();
-});
-
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
 async function settle(ms = 400): Promise<void> {
   await vi.advanceTimersByTimeAsync(ms);
 }
 
-describe("SyncController v3 — segment queue", () => {
-  it("mirror-first: target shows the source, then flips per sentence", async () => {
-    const { ctl, getState, pending, resolveNext } = makeController({ manual: true });
-    ctl.edit("left", "One. Two. Three.");
-    await settle(); // debounce fires, doc built, mirror applied, 3 requests queued
-
-    // Immediately after the requests start, the target is a verbatim mirror.
-    expect(getState().right.text).toBe("One. Two. Three.");
-    expect(pending.length).toBe(3); // one request per sentence (concurrency 3)
-
-    // Resolve the first sentence: only it flips.
-    resolveNext();
-    await settle(0);
-    expect(getState().right.text).toBe("[One.] Two. Three.");
-
-    resolveNext();
-    await settle(0);
-    expect(getState().right.text).toBe("[One.] [Two.] Three.");
-
-    resolveNext();
-    await settle(0);
-    expect(getState().right.text).toBe("[One.] [Two.] [Three.]");
-    expect(getState().phase).toBe("idle");
-  });
-
-  it("editing submits ONLY the edited sentence id and updates only its text", async () => {
+describe("SyncController v6 — bilingual segment table", () => {
+  it("initial forward sync translates one request per sentence", async () => {
     const { ctl, getState, calls } = makeController();
-    ctl.edit("left", "One. Two. Three.");
+    ctl.edit("left", "One. Two.");
     await settle();
-    expect(getState().right.text).toBe("[One.] [Two.] [Three.]");
-    const firstDoc = calls[0].doc;
-
-    // Edit the middle sentence.
-    ctl.edit("left", "One. Two edited. Three.");
-    await settle();
-    const lastCall = calls[calls.length - 1];
-    expect(lastCall.doc).toBe(firstDoc); // same document queue
-    expect(lastCall.items).toEqual([{ sid: 1, text: "Two edited." }]);
-    expect(lastCall.alive).toEqual([0, 1, 2]);
-    expect(getState().right.text).toBe("[One.] [Two edited.] [Three.]");
+    expect(calls.length).toBe(2);
+    expect(calls.map((c) => c.items[0].text).sort()).toEqual(["One.", "Two."]);
+    expect(getState().right.text).toBe("[One.] [Two.]");
+    expect(getState().left.text).toBe("One. Two.");
   });
 
-  it("inserting a sentence at the start only queues the new sid", async () => {
-    const { ctl, calls } = makeController();
-    ctl.edit("left", "Alpha. Beta. Gamma.");
-    await settle();
-
-    ctl.edit("left", "Zed. Alpha. Beta. Gamma.");
-    await settle();
-    const last = calls[calls.length - 1];
-    expect(last.items).toHaveLength(1);
-    expect(last.items[0].text).toBe("Zed.");
-    expect(last.items[0].sid).toBe(3); // fresh sid; suffix kept 0,1,2
-    expect(last.alive).toEqual([3, 0, 1, 2]);
-  });
-
-  it("deleting the last sentence needs no request, mirror just shrinks", async () => {
+  it("editing one source sentence requests only that sid and updates only it", async () => {
     const { ctl, getState, calls } = makeController();
-    ctl.edit("left", "Alpha. Beta. Gamma.");
+    ctl.edit("left", "One. Two.");
     await settle();
-    const countBefore = calls.length;
+    const n0 = calls.length;
 
-    ctl.edit("left", "Alpha. Beta.");
+    ctl.edit("left", "One revised. Two.");
     await settle();
-    expect(calls.length).toBe(countBefore); // no network call
-    expect(getState().right.text).toBe("[Alpha.] [Beta.]");
+    expect(calls.length).toBe(n0 + 1);
+    expect(calls[n0].items).toEqual([{ sid: 1, text: "One revised." }]);
+    expect(getState().right.text).toBe("[One revised.] [Two.]");
   });
 
-  it("target language change re-queues every sentence under a new pair", async () => {
-    const { ctl, calls } = makeController();
-    ctl.edit("left", "今天天气很好。我们走吧。");
+  it("editing one translation sentence back-syncs only that anchor sentence", async () => {
+    const { ctl, getState, calls } = makeController();
+    ctl.edit("left", "One. Two.");
     await settle();
-    const first = calls[0];
-    expect(first.to).toBe("en");
+    const leftDoc = calls[0].doc;
+    const n0 = calls.length;
 
-    ctl.changeLang("right", "ja");
+    ctl.edit("right", "[One.] [Two new.]");
     await settle();
-    const jpCalls = calls.filter((c) => c.to === "ja");
-    expect(jpCalls.length).toBeGreaterThanOrEqual(2); // every sentence re-queued
-    expect(jpCalls[0].doc).not.toBe(first.doc); // fresh doc queue
+    expect(calls.length).toBe(n0 + 1);
+    const rev = calls[n0];
+    expect(rev.doc).not.toBe(leftDoc);
+    expect(rev.items).toEqual([{ sid: 2, text: "[Two new.]" }]);
+    expect(getState().left.text).toBe("One. [[Two new.]]");
+    expect(getState().right.text).toBe("[One.] [Two new.]");
   });
 
-  it("alignFor exposes exact per-sentence mapping after sync", async () => {
+  it("appending a sentence on the translation side inserts it into the anchor", async () => {
+    const { ctl, getState, calls } = makeController();
+    ctl.edit("left", "One. Two.");
+    await settle();
+    const n0 = calls.length;
+
+    ctl.edit("right", "[One.] [Two.]\n[Three.]");
+    await settle();
+    expect(calls.length).toBe(n0 + 1);
+    expect(calls[n0].items).toEqual([{ sid: 3, text: "[Three.]" }]);
+    expect(getState().left.text).toBe("One. Two.\n[[Three.]]");
+    expect(getState().right.text).toBe("[One.] [Two.]\n[Three.]");
+  });
+
+  it("inserting a sentence mid-paragraph only translates the new sentence", async () => {
+    const { ctl, getState, calls } = makeController();
+    ctl.edit("left", "One. Two.");
+    await settle();
+    const n0 = calls.length;
+
+    ctl.edit("right", "[One.] [Mid.] [Two.]");
+    await settle();
+    expect(calls.length).toBe(n0 + 1);
+    expect(calls[n0].items[0].text).toBe("[Mid.]");
+    expect(getState().left.text).toBe("One. [[Mid.]] Two.");
+  });
+
+  it("deleting a sentence removes its counterpart without extra requests", async () => {
+    const { ctl, getState, calls } = makeController();
+    ctl.edit("left", "One. Two.");
+    await settle();
+    const n0 = calls.length;
+
+    ctl.edit("right", "[One.]");
+    await settle();
+    expect(calls.length).toBe(n0); // nothing to translate
+    expect(getState().left.text).toBe("One.");
+    expect(getState().right.text).toBe("[One.]");
+  });
+
+  it("alignFor exposes one row per sentence over the shared table", async () => {
     const { ctl, getState } = makeController();
-    ctl.edit("left", "One. Two. Three.");
+    ctl.edit("left", "One. Two.");
     await settle();
-    const alignment = ctl.alignFor("left");
-    expect(alignment).not.toBeNull();
-    const { rows } = alignment!;
-    expect(rows).toHaveLength(3);
+    const a = ctl.alignFor("left");
+    expect(a).not.toBeNull();
+    const rows = a!.rows;
+    expect(rows).toHaveLength(2);
     expect(rows[0].srcS).toBe(0);
-    expect(rows[rows.length - 1].srcE).toBe("One. Two. Three.".length);
-    expect(rows[0].dstS).toBe(0);
+    expect(rows[rows.length - 1].srcE).toBe("One. Two.".length);
     expect(rows[rows.length - 1].dstE).toBe(getState().right.text.length);
-    for (let i = 1; i < rows.length; i++) {
-      expect(rows[i].srcS).toBeGreaterThanOrEqual(rows[i - 1].srcE);
-      expect(rows[i].dstS).toBeGreaterThanOrEqual(rows[i - 1].dstE);
-    }
   });
 
   it("superseded chains never apply or toast stale results", async () => {
-    const { ctl, getState, pending, resolveNext, toasts } = makeController({
-      manual: true,
-    });
+    const { ctl, getState, pending, resolveNext, toasts } = makeController(true);
     ctl.edit("left", "first draft.");
     await settle();
     expect(pending.length).toBeGreaterThan(0);
 
-    // User keeps typing while the first chain is in flight.
     ctl.edit("left", "second draft.");
     await settle();
-    expect(pending.length).toBeGreaterThan(0);
-
-    // Let everything resolve in any order.
     while (pending.length > 0) resolveNext();
     await settle(0);
 
     expect(getState().right.text).toBe("[second draft.]");
-    expect(toasts).toEqual([]); // no bogus failure popup
+    expect(toasts).toEqual([]);
   });
 });

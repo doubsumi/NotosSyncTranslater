@@ -103,19 +103,9 @@ const NON_ENDERS = new Set(
   ).split(" ")
 );
 
-function isUpperLatin(ch: string): boolean {
-  const c = ch.charCodeAt(0);
-  return c >= 0x41 && c <= 0x5a;
-}
-
-function isHan(ch: string): boolean {
-  const c = ch.codePointAt(0)!;
-  return (c >= 0x4e00 && c <= 0x9fff) || (c >= 0x3400 && c <= 0x4dbf);
-}
-
 function wordBefore(content: string, index: number): string {
   let j = index - 1;
-  while (j >= 0 && /[A-Za-z]/.test(content[j])) j--;
+  while (j >= 0 && /[A-Za-z0-9]/.test(content[j])) j--;
   return content.slice(j + 1, index).toLowerCase();
 }
 
@@ -141,16 +131,13 @@ export function splitSentences(block: string): SentencePart[] {
         NON_ENDERS.has(prevWord) ||
         (i > 0 && block[i - 1] === ".")
       ) {
-        boundary = false; // abbreviation / ellipsis run
-      } else {
-        let j = i + 1;
-        while (j < n && CLOSERS.has(block[j])) j++;
-        let k = j;
-        while (k < n && /\s/.test(block[k])) k++;
-        if (k < n && !(isUpperLatin(block[k]) || isHan(block[k]))) {
-          boundary = false; // lowercase/digit follows: decimals, mid-text
-        }
+        // Abbreviation ("Mr.", "e.g.", "U.S.") or ellipsis run: not a break.
+        boundary = false;
       }
+      // Otherwise a "." (followed by whatever) ends the sentence. Real
+      // sentences may start with brackets/digits/lowercase, and translation
+      // output can contain periods before brackets — requiring an uppercase
+      // follower was too strict and collapsed rows.
     }
     if (!boundary) {
       i++;
@@ -238,20 +225,34 @@ export function composeUnits(
 // Bounded request units
 //
 // A single sentence may still be huge (dense prose pasted without any
-// sentence punctuation). Any such run is deterministically sub-chunked so that
-// no single upstream request can grow unboundedly — the root cause of
-// "whole paragraph resubmission + timeout". Chunks are content-derived, so
-// an edit inside one chunk leaves every other chunk textually identical and
-// still served from translation memory.
+// sentence punctuation). Any such run is deterministically sub-chunked so
+// that no single upstream request can grow unboundedly — the root cause of
+// "whole paragraph resubmission + timeout". Boundaries prefer natural breaks
+// (whitespace / weak clause delimiters), which keeps chunk identity stable
+// when an edit happens elsewhere: only the chunk(s) really touched change.
 // ---------------------------------------------------------------------------
 
-export const MAX_UNIT_CHARS = 400;
+/** Upper bound of one request unit (kept low so edits stay local). */
+export const MAX_UNIT_CHARS = 200;
+
+//: Characters we prefer to break a huge run on (clause-level, CJK aware).
+const WEAK_BREAKS = new Set([
+  "，", "、", "；", "：", ",", ";", ":", "—", "–", "…",
+]);
 
 function splitLongText(text: string, limit: number): string[] {
   const out: string[] = [];
   let rest = text;
   while (rest.length > limit) {
-    let cut = rest.lastIndexOf(" ", limit);
+    // Prefer the last natural break (whitespace or weak delimiter) ≤ limit.
+    let cut = -1;
+    for (let i = Math.min(limit, rest.length - 1); i >= 0; i--) {
+      const ch = rest[i];
+      if (ch === " " || WEAK_BREAKS.has(ch)) {
+        cut = i + 1;
+        break;
+      }
+    }
     if (cut <= 0) {
       cut = limit;
       // Never split a surrogate pair.

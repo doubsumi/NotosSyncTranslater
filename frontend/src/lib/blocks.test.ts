@@ -6,6 +6,7 @@ import {
   fnv1a,
   joinSentenceParts,
   mapBlocks,
+  MAX_UNIT_CHARS,
   rebuildWithTranslations,
   splitBlocks,
   splitRequestUnits,
@@ -138,15 +139,39 @@ describe("splitRequestUnits (bounded units)", () => {
     const dense = "x".repeat(1000);
     const units = splitRequestUnits(dense);
     expect(units.length).toBeGreaterThan(2);
-    for (const u of units) expect(u.text.length).toBeLessThanOrEqual(400);
+    for (const u of units)
+      expect(u.text.length).toBeLessThanOrEqual(MAX_UNIT_CHARS);
     expect(units.map((u) => u.text + u.ws).join("")).toBe(dense);
   });
 
   it("splits long sentences at whitespace when available", () => {
     const long = `${"word ".repeat(200)}end`;
     const units = splitRequestUnits(long);
-    for (const u of units) expect(u.text.length).toBeLessThanOrEqual(400);
+    for (const u of units)
+      expect(u.text.length).toBeLessThanOrEqual(MAX_UNIT_CHARS);
     expect(units.map((u) => u.text + u.ws).join("")).toBe(long);
+  });
+
+  it("keeps chunk boundaries content-anchored: a mid-run edit is local", () => {
+    // ~360 chars of word runs without sentence punctuation (> MAX_UNIT_CHARS).
+    const base = Array(90).fill("alpha").join(" ");
+    const words = base.split(" ");
+    words[45] = "bravo"; // edit deep inside the run
+    const edited = words.join(" ");
+    const before = splitRequestUnits(base).map((u) => u.text);
+    const after = splitRequestUnits(edited).map((u) => u.text);
+    expect(before.length).toBe(after.length);
+    const changed = before.filter((t, i) => t !== after[i]).length;
+    expect(changed).toBeLessThanOrEqual(2); // only local chunk(s) differ
+  });
+
+  it("splits huge CJK runs on clause punctuation (,、;) when present", () => {
+    const block = Array(60).fill("今天天气很好,我们去公园散步。").join(""); // ends 。… commas
+    // The trailing 。 is a sentence ender; the block still exceeds the cap, and
+    // the clauses provide stable break points.
+    const units = splitRequestUnits(block);
+    for (const u of units) expect(u.text.length).toBeLessThanOrEqual(MAX_UNIT_CHARS);
+    expect(units.map((u) => u.text + u.ws).join("")).toBe(block);
   });
 });
 

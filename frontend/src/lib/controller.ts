@@ -1,28 +1,31 @@
 // ---------------------------------------------------------------------------
-// SyncController — the brain of the two-way live translator (v3).
+// SyncController (v6) — bilingual segment-table architecture.
 //
-// Queue-based incremental model (aligned with the product spec):
+// Model
+// -----
+// The document is an ordered token list: sentence tokens (each with a stable
+// segment id) interleaved with separator tokens (whitespace/newlines). Every
+// segment stores BOTH language texts (`L` and `R`); the two panes are just
+// two views over the same table:
+//     left  = join of segment.L + separators
+//     right = join of segment.R + separators
 //
-//   * Every pane is its own *document* (`docId`). When the user edits a pane
-//     it becomes the source; the other pane becomes the mirror.
-//   * Source text is segmented into sentence units with stable numeric ids
-//     (`sid`). Edits preserve the ids of every unchanged sentence via a
-//     prefix/suffix anchor diff; only inserted/re-written sentences change.
-//   * Mirror-first rendering: the target pane first shows a verbatim mirror of
-//     the source (every sentence is its own placeholder), then each sentence
-//     is submitted to the backend queue *one by one* (`sid` addressing) and
-//     flips to its translation as its result arrives — the frontend only ever
-//     replaces the text of that one id.
-//   * On edit the frontend submits ONLY the edited sentence's `sid` (+text);
-//     the backend answers that id and the frontend updates just that region.
-//   * Per-pane documents let both sides be edited independently; while the
-//     user types in a pane, writes from the other direction are cancelled and
-//     never overwrite what they are editing.
+// Editing either pane maps back to token-level CRUD (see lib/tokens.ts):
+//   * unchanged sentences keep their id and their counterpart translation;
+//   * an edited sentence keeps its id, clears only its counterpart, and is
+//     re-translated alone;
+//   * inserted/deleted sentences add/remove the shared segment at the same
+//     position on both sides.
+//
+// Because rendering derives from the segment table, an update to one sentence
+// changes exactly that sentence's span in the editor (minimal diff) — there
+// is no whole-document recomposition, no direction special-casing, no
+// truncation.
 // ---------------------------------------------------------------------------
 
-import { mapBlocks, splitBlocks, splitRequestUnits } from "./blocks";
 import { defaultTargetFor, detectLanguage, type LangCode } from "./detection";
 import { debounce, type Debounced } from "./debounce";
+import { alignTokenLists, tokenize, type RawToken } from "./tokens";
 import { type Api, type SegSyncResult } from "./api";
 
 export type Side = "left" | "right";
@@ -30,9 +33,7 @@ export const opposite = (side: Side): Side => (side === "left" ? "right" : "left
 
 export interface PaneState {
   text: string;
-  /** Selected code; "auto" means auto-detect. */
   lang: LangCode;
-  /** Detected language when `lang === "auto"` ("auto" = not yet known). */
   detected: LangCode;
   busy: boolean;
 }
@@ -72,11 +73,9 @@ export interface ControllerOptions {
   onToast: (toast: ToastMessage) => void;
   debounceMs?: number;
   maxWaitMs?: number;
-  /** How many sentence requests may fly concurrently (per sentence). */
   concurrency?: number;
 }
 
-/** One aligned sentence: character range in both panes. */
 export interface AlignRow {
   srcS: number;
   srcE: number;
@@ -85,30 +84,17 @@ export interface AlignRow {
 }
 
 export interface Alignment {
-  /** The pane holding the *source* text of the pair. */
   srcSide: Side;
   rows: AlignRow[];
 }
 
-interface Slot {
-  sid: number;
-  text: string;
-  translated: string | null;
-  provider: string;
+interface Segment {
+  id: number;
+  L: string;
+  R: string;
 }
 
-interface Doc {
-  docId: string;
-  from: LangCode;
-  to: LangCode;
-  sidSeq: number;
-  slots: Slot[];
-}
-
-export interface ComposeResult {
-  text: string;
-  rows: AlignRow[];
-}
+type Token = { type: "text"; id: number } | { type: "sep"; text: string };
 
 const EMPTY_PANE = (): PaneState => ({
   text: "",
@@ -125,7 +111,6 @@ function newDocId(): string {
   }
 }
 
-/** Pure pair computation shared by the controller and the UI labels. */
 export function computePair(
   source: Pick<PaneState, "text" | "lang" | "detected">,
   target: Pick<PaneState, "lang">,
@@ -142,47 +127,6 @@ export function computePair(
     to = base !== "auto" ? defaultTargetFor(base) : "zh";
   }
   return { from, to };
-}
-
-// ---------------------------------------------------------------------------
-// Pure mirror composition (also exported for tests).
-// ---------------------------------------------------------------------------
-/**
- * Build the target text from source layout + per-slot resolution. When a slot
- * has no translation yet its source text is used (the placeholder), so the
- * mirror starts as a verbatim copy of the source and flips sentence by
- * sentence. Newlines/layout of the source are preserved verbatim.
- */
-export function composeMirrorInternal(
-  srcText: string,
-  resolve: () => string | null
-): ComposeResult {
-  let out = "";
-  let cursor = 0;
-  const rows: AlignRow[] = [];
-  let dstPos = 0;
-  for (const [bStart, bEnd] of mapBlocks(srcText)) {
-    out += srcText.slice(cursor, bStart);
-    const content = srcText.slice(bStart, bEnd);
-    const units = splitRequestUnits(content);
-    let srcLocal = 0;
-    for (const unit of units) {
-      const resolved = resolve();
-      const shown = resolved ?? unit.text;
-      const srcS = bStart + srcLocal;
-      const srcE = srcS + unit.text.length;
-      out += shown;
-      out += unit.ws;
-      const dstS = dstPos;
-      const dstE = dstS + shown.length;
-      dstPos = dstE + unit.ws.length;
-      rows.push({ srcS, srcE, dstS, dstE });
-      srcLocal += unit.text.length + unit.ws.length;
-    }
-    cursor = bEnd;
-  }
-  out += srcText.slice(cursor);
-  return { text: out, rows };
 }
 
 export class SyncController {
@@ -203,9 +147,11 @@ export class SyncController {
     progress: null,
   };
 
-  private docs: Record<Side, Doc | null> = { left: null, right: null };
-  /** Side whose text is the source of the currently aligned pair. */
-  private mappingSide: Side | null = null;
+  // ---- segment table -----------------------------------------------------
+  private tokens: Token[] = [];
+  private segs = new Map<number, Segment>();
+  private nextId = 1;
+  private docIds: Record<Side, string | null> = { left: null, right: null };
   private generation = 0;
   private aborter: AbortController | null = null;
   private toastSeq = 0;
@@ -220,8 +166,6 @@ export class SyncController {
   }
 
   // ------------------------------------------------------------------
-  // Public actions
-  // ------------------------------------------------------------------
   edit(side: Side, text: string): void {
     const pane = this.state[side];
     this.setState((s) => ({
@@ -229,11 +173,6 @@ export class SyncController {
       [side]: { ...pane, text, detected: this.refreshDetected(side, text) },
       active: side,
     }));
-    if (this.mappingSide !== side) {
-      // The user switched which side they edit: stop the other direction.
-      this.mappingSide = null;
-      this.cancelQueued();
-    }
     this.schedule();
   }
 
@@ -244,21 +183,16 @@ export class SyncController {
       [side]: {
         ...pane,
         lang,
-        detected:
-          lang === "auto" ? this.refreshDetected(side, pane.text) : pane.detected,
+        detected: lang === "auto" ? this.refreshDetected(side, pane.text) : pane.detected,
       },
     }));
-    this.cancelQueued();
-    const active = this.state.active;
-    if (active) this.runNow();
+    if (this.state.active) this.runNow();
   }
 
   swap(): void {
     const s = this.state;
     this.cancelQueued();
-    this.mappingSide = null;
-    this.docs.left = null;
-    this.docs.right = null;
+    this.resetTable();
     this.setState((st) => ({
       ...st,
       left: { ...s.right, busy: false },
@@ -274,9 +208,7 @@ export class SyncController {
     this.cancelQueued();
     this.debounced.cancel();
     this.generation++;
-    this.mappingSide = null;
-    this.docs.left = null;
-    this.docs.right = null;
+    this.resetTable();
     this.setState((s) => ({
       ...s,
       left: { ...s.left, text: "", detected: "auto", busy: false },
@@ -290,29 +222,26 @@ export class SyncController {
     }));
   }
 
-  /** Re-run synchronisation (used by error-retry toasts). */
   retry(): void {
-    const active = this.state.active;
-    if (!active) return;
-    this.runNow();
+    if (this.state.active) this.runNow();
   }
 
-  /** Full re-sync: every sentence is re-queued under a fresh document. */
   retranslateAll(): void {
-    const active = this.state.active;
-    if (!active) return;
-    this.cancelQueued();
-    this.mappingSide = null;
-    this.docs[active] = null;
-    this.runNow();
+    const side = this.state.active;
+    if (!side) return;
+    // Clear every counterpart and re-translate the whole source side.
+    for (const seg of this.segs.values()) {
+      if (side === "left") seg.R = "";
+      else seg.L = "";
+    }
+    const ids = this.tokenIds();
+    this.renderAndApply();
+    void this.streamTranslations(side, ids);
   }
 
-  /** Load a previously persisted session without triggering translation. */
   restore(left: PaneState, right: PaneState): void {
     this.cancelQueued();
-    this.mappingSide = null;
-    this.docs.left = null;
-    this.docs.right = null;
+    this.resetTable();
     this.setState((s) => ({ ...s, left, right, active: null }));
   }
 
@@ -322,24 +251,18 @@ export class SyncController {
   }
 
   /**
-   * Exact sentence alignment of the displayed pair, or null when the target
-   * pane is not byte-identical to the current mirror composition (e.g. the
-   * target was hand-edited or a sync is still mid-flight).
+   * Exact sentence alignment for cross-pane highlight/linking. Rows are
+   * derived directly from the segment table (one row per sentence id).
    */
-  alignFor(selectedSide: Side): Alignment | null {
-    const srcSide = this.mappingSide;
-    if (!srcSide) return null;
-    if (selectedSide !== srcSide && selectedSide !== opposite(srcSide)) return null;
-    const src = this.state[srcSide];
-    const dst = this.state[opposite(srcSide)];
-    if (!src.text.trim()) return null;
-    const composed = this.composeMirror(srcSide, src.text);
-    if (composed.text !== dst.text) return null;
-    return { srcSide, rows: composed.rows };
+  alignFor(_selectedSide: Side): Alignment | null {
+    if (!this.segs.size) return null;
+    const rendered = this.renderWithOffsets();
+    if (rendered.left !== this.state.left.text || rendered.right !== this.state.right.text) {
+      return null;
+    }
+    return { srcSide: "left", rows: rendered.rows };
   }
 
-  // ------------------------------------------------------------------
-  // Internals
   // ------------------------------------------------------------------
   private setState(mutate: (s: ControllerState) => ControllerState): void {
     this.state = mutate(this.state);
@@ -361,14 +284,12 @@ export class SyncController {
 
   private schedule(): void {
     this.debounced.cancel();
-    this.debounced.schedule(() => {
-      void this.run(false);
-    });
+    this.debounced.schedule(() => void this.run());
   }
 
   private runNow(): void {
     this.debounced.cancel();
-    void this.run(false);
+    void this.run();
   }
 
   private cancelQueued(): void {
@@ -378,75 +299,122 @@ export class SyncController {
     }
   }
 
-  /** Compose the mirror for the currently stored doc of `srcSide`. */
-  private composeMirror(srcSide: Side, srcText: string): ComposeResult {
-    const doc = this.docs[srcSide];
-    let idx = 0;
-    return composeMirrorInternal(srcText, () => {
-      const slot = doc?.slots[idx];
-      idx++;
-      return slot ? slot.translated : null;
-    });
+  private resetTable(): void {
+    this.tokens = [];
+    this.segs.clear();
+    this.nextId = 1;
   }
 
-  /** Compose from an explicit slot list (used right after rebuilding). */
-  private rebuildCompose(srcText: string, slots: readonly Slot[]): ComposeResult {
-    let idx = 0;
-    return composeMirrorInternal(srcText, () => slots[idx++]?.translated ?? null);
+  private tokenIds(): number[] {
+    const out: number[] = [];
+    for (const t of this.tokens) if (t.type === "text") out.push(t.id);
+    return out;
+  }
+
+  private segField(side: Side): "L" | "R" {
+    return side === "left" ? "L" : "R";
+  }
+
+  private renderSide(side: Side): string {
+    const field = this.segField(side);
+    let out = "";
+    for (const t of this.tokens) {
+      if (t.type === "sep") out += t.text;
+      else out += this.segs.get(t.id)?.[field] ?? "";
+    }
+    return out;
+  }
+
+  private renderWithOffsets(): { left: string; right: string; rows: AlignRow[] } {
+    let l = "";
+    let r = "";
+    const rows: AlignRow[] = [];
+    for (const t of this.tokens) {
+      if (t.type === "sep") {
+        l += t.text;
+        r += t.text;
+        continue;
+      }
+      const seg = this.segs.get(t.id);
+      const ls = l.length;
+      const rs = r.length;
+      const lt = seg?.L ?? "";
+      const rt = seg?.R ?? "";
+      l += lt;
+      r += rt;
+      rows.push({ srcS: ls, srcE: ls + lt.length, dstS: rs, dstE: rs + rt.length });
+    }
+    return { left: l, right: r, rows };
+  }
+
+  private applyPane(side: Side, text: string): void {
+    const pane = this.state[side];
+    if (pane.text === text) return;
+    this.setState((s) => ({
+      ...s,
+      [side]: { ...pane, text },
+      statusText: s.statusText,
+    }));
+  }
+
+  private renderAndApply(): void {
+    this.applyPane("left", this.renderSide("left"));
+    this.applyPane("right", this.renderSide("right"));
   }
 
   // ------------------------------------------------------------------
-  // Core sync
-  // ------------------------------------------------------------------
-  private async run(force = false): Promise<void> {
-    const active = this.state.active;
-    if (!active) return;
+  private async run(): Promise<void> {
+    const side = this.state.active;
+    if (!side) return;
     this.cancelQueued();
     this.generation++;
-    const src = this.state[active];
-    const dstSide = opposite(active);
-    const target = this.state[dstSide];
+    const src = this.state[side];
+    const otherSide = opposite(side);
+    const other = this.state[otherSide];
     const srcText = src.text;
 
-    if (srcText.length > 0 && target.text === srcText) {
+    if (srcText.length > 0 && other.text === srcText) {
       this.clearBusy();
       return;
     }
     if (srcText.trim().length === 0) {
-      if (target.text.length > 0) this.applyTo(dstSide, "");
-      this.docs[active] = null;
-      this.mappingSide = null;
+      this.resetTable();
       this.setState((s) => ({
         ...s,
         phase: "idle",
         statusText: null,
         progress: null,
-        left: { ...s.left, busy: false },
-        right: { ...s.right, busy: false },
+        left: { ...s.left, busy: false, text: "" },
+        right: { ...s.right, busy: false, text: "" },
       }));
       return;
     }
 
-    const pair = computePair(src, target, srcText);
+    const pair = computePair(src, other, srcText);
     if (pair.to === "auto") {
       this.clearBusy();
       return;
     }
 
-    // Rebuild the doc: keep sids stable for unchanged sentences.
-    const { doc, changed } = this.buildDoc(active, pair, srcText, force);
-    this.docs[active] = doc;
+    // ---- token-level CRUD ---------------------------------------------
+    const nextRaw = tokenize(srcText);
+    const { tokens: nextTokens, changedIds, addedIds, removedIds } = this.applyTokenEdit(
+      side,
+      nextRaw
+    );
+    for (const id of removedIds) this.segs.delete(id);
+    this.tokens = nextTokens;
 
-    // Mirror-first: the target pane shows the placeholder document before
-    // any network result arrives.
-    const composed = this.rebuildCompose(srcText, doc.slots);
-    if (composed.text !== target.text) {
-      this.applyTo(dstSide, composed.text);
+    const pending = [...new Set([...addedIds, ...changedIds])];
+    const field = this.segField(side);
+    const otherField = this.segField(otherSide);
+    for (const id of pending) {
+      const seg = this.segs.get(id);
+      if (seg) seg[otherField] = "";
     }
-    if (this.state[active].text !== srcText) return; // user typed meanwhile
+    this.renderAndApply();
 
-    if (changed.length === 0) {
-      this.mappingSide = active;
+    if (pending.length === 0) {
       this.setState((s) => ({
         ...s,
         phase: "idle",
@@ -458,124 +426,152 @@ export class SyncController {
       return;
     }
 
-    await this.streamSegments({ active, dstSide, doc, changed });
+    // Every changed/inserted sentence is submitted with its own id.
+    const requested = pending.filter((id) => {
+      const seg = this.segs.get(id);
+      return seg !== undefined && (seg[field] ?? "").length > 0;
+    });
+    await this.streamTranslations(side, requested);
   }
 
   /**
-   * Re-segment the source and assign stable sids. Unchanged sentences (by the
-   * prefix/suffix anchor diff) keep their ids and cached translations.
+   * Align the existing token table against the edited side's new tokens.
+   * Returns the new token list plus the changed/added/removed segment ids.
    */
-  private buildDoc(
+  private applyTokenEdit(
     side: Side,
-    pair: Pair,
-    text: string,
-    force: boolean
-  ): { doc: Doc; changed: number[] } {
-    const prev = this.docs[side];
-    const units = this.unitsOf(text);
-    const prevUsable =
-      prev !== null &&
-      !force &&
-      prev.from === pair.from &&
-      prev.to === pair.to &&
-      prev.slots.length > 0;
-    const docId = prevUsable ? prev.docId : newDocId();
+    nextRaw: RawToken[]
+  ): { tokens: Token[]; changedIds: number[]; addedIds: number[]; removedIds: number[] } {
+    const field = this.segField(side);
+    const oldRaw: RawToken[] = this.tokens.map((t) =>
+      t.type === "text" ? { type: "text", text: this.segs.get(t.id)?.[field] ?? "" } : t
+    );
 
-    if (!prevUsable) {
-      const slots: Slot[] = units.map((t, i) => ({
-        sid: i,
-        text: t,
-        translated: null,
-        provider: "",
-      }));
-      return {
-        doc: { docId, from: pair.from, to: pair.to, sidSeq: units.length, slots },
-        changed: slots.map((_, i) => i),
-      };
-    }
-
-    const prevUnits = prev.slots.map((s) => s.text);
-    const n = prevUnits.length;
-    const m = units.length;
+    // Prefix / suffix trim (identical tokens keep id & layout).
     let lo = 0;
-    while (lo < n && lo < m && prevUnits[lo] === units[lo]) lo++;
-    let hiN = n;
-    let hiM = m;
-    while (hiN > lo && hiM > lo && prevUnits[hiN - 1] === units[hiM - 1]) {
-      hiN--;
-      hiM--;
+    while (
+      lo < oldRaw.length &&
+      lo < nextRaw.length &&
+      oldRaw[lo].type === nextRaw[lo].type &&
+      oldRaw[lo].text === nextRaw[lo].text
+    ) {
+      lo++;
+    }
+    let hiOld = oldRaw.length;
+    let hiNew = nextRaw.length;
+    while (
+      hiOld > lo &&
+      hiNew > lo &&
+      oldRaw[hiOld - 1].type === nextRaw[hiNew - 1].type &&
+      oldRaw[hiOld - 1].text === nextRaw[hiNew - 1].text
+    ) {
+      hiOld--;
+      hiNew--;
     }
 
-    const changed: number[] = [];
-    const outSlots: Slot[] = [];
-    // Prefix: identical -> reuse old slots unchanged.
-    for (let i = 0; i < lo; i++) outSlots.push(prev.slots[i]);
-    // Middle.
-    const oldMid = hiN - lo;
-    const newMid = hiM - lo;
-    let counter = prev.sidSeq;
-    if (newMid === oldMid) {
-      // Pure rewrite(s) inside the middle: slots keep their sids.
-      for (let i = lo; i < hiM; i++) {
-        const oldSlot = prev.slots[i];
-        const sameText = oldSlot.text === units[i];
-        const translated = sameText ? oldSlot.translated : null;
-        outSlots.push({
-          sid: oldSlot.sid,
-          text: units[i],
-          translated,
-          provider: sameText ? oldSlot.provider : "",
-        });
-        if (!sameText || translated === null) changed.push(i);
+    const oldMid = oldRaw.slice(lo, hiOld);
+    const newMid = nextRaw.slice(lo, hiNew);
+    const changedIds: number[] = [];
+    const addedIds: number[] = [];
+    const removedIds: number[] = [];
+
+    // Middle: pairwise replace when counts match (keeps id on edits), else
+    // LCS-based insert/delete.
+    const middleTokens: Token[] = [];
+    if (oldMid.length === newMid.length) {
+      for (let i = 0; i < newMid.length; i++) {
+        const o = oldMid[i];
+        const n = newMid[i];
+        const oldTok = this.tokens[lo + i];
+        if (n.type === "sep") {
+          middleTokens.push({ type: "sep", text: n.text });
+          if (o.type === "text" && oldTok.type === "text") removedIds.push(oldTok.id);
+          continue;
+        }
+        if (o.type === "text" && oldTok.type === "text") {
+          if (o.text !== n.text) {
+            const seg = this.segs.get(oldTok.id);
+            if (seg) seg[field] = n.text;
+            changedIds.push(oldTok.id);
+          }
+          middleTokens.push({ type: "text", id: oldTok.id });
+        } else {
+          // Structure mismatch inside equal-length middle: treat as insert.
+          const id = this.nextId++;
+          this.segs.set(id, { id, L: "", R: "" });
+          (this.segs.get(id) as Segment)[field] = n.text;
+          addedIds.push(id);
+          middleTokens.push({ type: "text", id });
+        }
       }
     } else {
-      // Insertion/deletion of whole sentences: new sids for the middle.
-      for (let i = lo; i < hiM; i++) {
-        outSlots.push({
-          sid: counter++,
-          text: units[i],
-          translated: null,
-          provider: "",
-        });
-        changed.push(i);
+      const { matched, oldOnly } = alignTokenLists(oldMid, newMid);
+      const byNew = new Map(matched.map(([oi, ni]) => [ni, oi]));
+      const matchedOld = new Set(matched.map(([oi]) => oi));
+      for (let ni = 0; ni < newMid.length; ni++) {
+        const n = newMid[ni];
+        const oi = byNew.get(ni);
+        if (oi !== undefined) {
+          const o = oldMid[oi];
+          const oldTok = this.tokens[lo + oi];
+          if (n.type === "text" && o.type === "text" && oldTok.type === "text") {
+            middleTokens.push({ type: "text", id: oldTok.id });
+          } else {
+            middleTokens.push({ type: "sep", text: n.text });
+          }
+          continue;
+        }
+        if (n.type === "sep") {
+          middleTokens.push({ type: "sep", text: n.text });
+        } else {
+          const id = this.nextId++;
+          this.segs.set(id, { id, L: "", R: "" });
+          (this.segs.get(id) as Segment)[field] = n.text;
+          addedIds.push(id);
+          middleTokens.push({ type: "text", id });
+        }
+      }
+      for (const oi of oldOnly) {
+        if (!matchedOld.has(oi) && oldMid[oi].type === "text") {
+          const oldTok = this.tokens[lo + oi];
+          if (oldTok.type === "text") removedIds.push(oldTok.id);
+        }
       }
     }
-    // Suffix: identical -> reuse old slots.
-    for (let i = hiM; i < m; i++) {
-      outSlots.push(prev.slots[hiN + (i - hiM)]);
-    }
 
-    return {
-      doc: { docId, from: pair.from, to: pair.to, sidSeq: counter, slots: outSlots },
-      changed,
-    };
-  }
-
-  private unitsOf(text: string): string[] {
-    const out: string[] = [];
-    for (const block of splitBlocks(text)) {
-      for (const unit of splitRequestUnits(block)) out.push(unit.text);
+    // Reassemble.
+    const out: Token[] = [];
+    for (let i = 0; i < lo; i++) {
+      const t = this.tokens[i];
+      out.push(t);
     }
-    return out;
+    out.push(...middleTokens);
+    for (let i = hiOld; i < this.tokens.length; i++) {
+      out.push(this.tokens[i]);
+    }
+    return { tokens: out, changedIds, addedIds, removedIds };
   }
 
   // ------------------------------------------------------------------
-  // Streaming submission — one request per sentence, bounded concurrency
-  // ------------------------------------------------------------------
-  private async streamSegments(args: {
-    active: Side;
-    dstSide: Side;
-    doc: Doc;
-    changed: number[];
-  }): Promise<void> {
-    const { active, dstSide, doc, changed } = args;
+  private docId(side: Side): string {
+    if (!this.docIds[side]) this.docIds[side] = newDocId();
+    return this.docIds[side] as string;
+  }
+
+  private async streamTranslations(side: Side, ids: number[]): Promise<void> {
+    if (ids.length === 0) return;
     const gen = ++this.generation;
     const aborter = new AbortController();
     this.aborter = aborter;
     this.startedAt = performance.now();
-    const srcSnapshot = this.state[active].text;
+    const otherSide = opposite(side);
+    const field = this.segField(side);
+    const otherField = this.segField(otherSide);
+    const src = this.state[side];
+    const pair = computePair(src, this.state[otherSide], src.text);
+    const alive = this.tokenIds();
 
-    const total = changed.length;
+    const total = ids.length;
     let done = 0;
     let failed = 0;
     let lastProvider: string | null = null;
@@ -586,57 +582,45 @@ export class SyncController {
       phase: "translating",
       statusText: `正在翻译 0/${total} 句`,
       progress: { done: 0, total },
-      [dstSide]: { ...s[dstSide], busy: true },
+      [otherSide]: { ...s[otherSide], busy: true },
     }));
 
-    const applyMirror = (): void => {
-      const nowSrc = this.state[active];
-      if (this.state.active !== active || nowSrc.text !== srcSnapshot) return;
-      const composed = this.rebuildCompose(srcSnapshot, doc.slots);
-      if (this.state[dstSide].text !== composed.text) {
-        this.applyTo(dstSide, composed.text);
-      }
-    };
-    applyMirror();
-
-    const queue = changed.slice();
+    const queue = ids.slice();
     const worker = async (): Promise<void> => {
       for (;;) {
         if (this.generation !== gen) return;
-        const slotIdx = queue.shift();
-        if (slotIdx === undefined) return;
-        const slot = doc.slots[slotIdx];
-        const alive = doc.slots.map((s) => s.sid);
-
+        const id = queue.shift();
+        if (id === undefined) return;
+        const seg = this.segs.get(id);
+        if (!seg) {
+          done++;
+          continue;
+        }
+        const text = seg[field];
         let result: SegSyncResult;
         try {
-          const responses = await this.api.syncDocSegments(
-            doc.docId,
-            doc.from,
-            doc.to,
-            [{ sid: slot.sid, text: slot.text }],
+          const res = await this.api.syncDocSegments(
+            this.docId(side),
+            pair.from,
+            pair.to,
+            [{ sid: id, text }],
             alive,
             aborter.signal
           );
-          result = responses[0];
+          result = res[0];
         } catch (err) {
           if (this.generation !== gen) return;
           if (err instanceof DOMException && err.name === "AbortError") return;
           result = {
-            sid: slot.sid,
+            sid: id,
             ok: false,
-            error: {
-              code: "NETWORK",
-              message: err instanceof Error ? err.message : String(err),
-            },
+            error: { code: "NETWORK", message: err instanceof Error ? err.message : String(err) },
           };
         }
         if (this.generation !== gen) return;
-
         if (result.ok && result.translated !== undefined) {
-          slot.translated = result.translated;
-          slot.provider = result.provider ?? "";
-          lastProvider = lastProvider ?? (result.provider ?? null);
+          seg[otherField] = result.translated;
+          lastProvider = lastProvider ?? result.provider ?? null;
         } else {
           failed++;
           firstError = firstError || result.error?.message || "翻译失败";
@@ -647,7 +631,7 @@ export class SyncController {
           statusText: `正在翻译 ${done}/${total} 句`,
           progress: { done, total },
         }));
-        applyMirror();
+        this.renderAndApply();
       }
     };
 
@@ -655,9 +639,7 @@ export class SyncController {
       Array.from({ length: Math.min(this.concurrency, total) }, () => worker())
     );
     if (this.generation !== gen) return;
-
     this.aborter = null;
-    this.mappingSide = active;
     const elapsed = Math.round(performance.now() - this.startedAt);
     this.setState((s) => ({
       ...s,
@@ -687,15 +669,5 @@ export class SyncController {
         onAction: () => this.retry(),
       });
     }
-  }
-
-  private applyTo(dst: Side, text: string): void {
-    const pane = this.state[dst];
-    if (pane.text === text) return;
-    this.setState((s) => ({
-      ...s,
-      [dst]: { ...pane, text },
-      statusText: s.statusText,
-    }));
   }
 }
